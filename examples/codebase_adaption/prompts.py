@@ -94,11 +94,64 @@ MEMORY_INSTRUCTION_V3_HEAD = (
 )
 
 
+# ── WRITE prompt for AgentCL coding streams (agentcl_code task, user-approved
+#    2026-09-18). Same structure as v3; wording adapted from repositories to a
+#    stream of function-implementation problems, first section renamed to
+#    "Function Library". Selected per episode via prompt_set="agentcl_code". ──
+AGENTCL_MEMORY_SYSTEM = (
+    "You are a software engineer solving a sequence of Python function-implementation "
+    "problems in the same environment. You keep a running, structured MEMORY of what "
+    "you have learned: the functions you have implemented and how to work in this "
+    "environment effectively. At the end of each problem you are given your PREVIOUS "
+    "memory plus the problem you just worked on, and you output the UPDATED memory — "
+    "carrying forward what you already confirmed and folding in the new problem's "
+    "evidence — for use in future problems."
+)
+
+AGENTCL_MEMORY_INSTRUCTION = (
+    "The problem above is over. Update your running memory in EXACTLY these two "
+    "sections:\n\n"
+    "### Function Library\n"
+    "One bullet per function you have implemented: its name and signature, what it "
+    "does and returns, and key implementation details.\n\n"
+    "### Lessons & Pitfalls\n"
+    "One bullet per lesson about HOW to work: approaches that succeeded, approaches "
+    "that failed and why, and checks worth doing before submitting.\n\n"
+    "Carry forward everything you already confirmed in your previous memory; "
+    "ADD this problem's new findings and only revise an entry when THIS problem gives "
+    "direct evidence against it — do NOT delete a confirmed fact just because a "
+    "problem went badly. Output ONLY the two sections."
+)
+
+AGENTCL_WRITE_TRANSCRIPT_PREAMBLE = (
+    "Below is the complete, read-only transcript of the problem you just finished. "
+    "It is provided for reference only."
+)
+
+AGENTCL_MEMORY_INSTRUCTION_V3_HEAD = (
+    "Above is the entire transcript - the problem is OVER. Do NOT continue it, do NOT "
+    "run commands, do NOT output bash. Your ONLY job is to rewrite the memory based "
+    "on the transcript.\n\n"
+    "Reflect on the final outcome shown in the transcript before writing: if the "
+    "submission PASSED, identify what was key to this success so it can be reused "
+    "in future problems; if it FAILED or the step budget ran out, diagnose the most "
+    "likely root cause of the failure and record it as a lesson.\n\n"
+)
+
+_WRITE_PROMPT_SETS = {
+    None: (MEMORY_SYSTEM, MEMORY_INSTRUCTION, WRITE_TRANSCRIPT_PREAMBLE, MEMORY_INSTRUCTION_V3_HEAD,
+           "The task above is over. Update your running memory"),
+    "agentcl_code": (AGENTCL_MEMORY_SYSTEM, AGENTCL_MEMORY_INSTRUCTION, AGENTCL_WRITE_TRANSCRIPT_PREAMBLE,
+                     AGENTCL_MEMORY_INSTRUCTION_V3_HEAD, "The problem above is over. Update your running memory"),
+}
+
+
 def build_write_messages(
     *,
     previous_memory: str,
     instance_messages: list[dict[str, str]],
     v3: bool = False,
+    prompt_set: str | None = None,
 ) -> list[dict[str, str]]:
     """WRITE messages, mirroring the offline memory-rewrite call (window=1):
 
@@ -107,22 +160,23 @@ def build_write_messages(
     v3=True additionally wraps the transcript in the sandwich framing and
     prepends the outcome-reflection guidance (see WRITE prompt v3 above).
     """
-    instr = MEMORY_INSTRUCTION
+    # prompt_set selects the wording (None = codebase adaptation, the training
+    # default; "agentcl_code" = AgentCL coding streams). Unknown values fall back
+    # to the default so training episodes are never affected.
+    system, instr, preamble, v3_head, over_sentence = _WRITE_PROMPT_SETS.get(
+        prompt_set, _WRITE_PROMPT_SETS[None]
+    )
     if v3:
-        instr = instr.replace(
-            "The task above is over. Update your running memory",
-            "Update your running memory",
-            1,
-        )
+        instr = instr.replace(over_sentence, "Update your running memory", 1)
     prev = (previous_memory or "").strip()
     if prev:
         instr = f"Your previous memory:\n{prev}\n\n{instr}"
     if v3:
-        instr = MEMORY_INSTRUCTION_V3_HEAD + instr
+        instr = v3_head + instr
     turns = [dict(m) for m in instance_messages]
-    pre = [{"role": "user", "content": WRITE_TRANSCRIPT_PREAMBLE}] if v3 else []
+    pre = [{"role": "user", "content": preamble}] if v3 else []
     return [
-        {"role": "system", "content": MEMORY_SYSTEM},
+        {"role": "system", "content": system},
         *pre,
         *turns,
         {"role": "user", "content": instr},

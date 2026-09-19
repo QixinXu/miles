@@ -526,11 +526,25 @@ def _pack_write_sample(seed, prompt_ids, response_text, response_ids, response_l
 _ORIG_SINGULARITY_EXEC_ARGS = os.environ.get("CLBENCH_SINGULARITY_EXEC_ARGS")
 
 
-def _make_task(args, split: str, instance_ids: list[str], stage_labels: list[str]):
+def _make_task(args, split: str, instance_ids: list[str], stage_labels: list[str], task_family: str | None = None):
     root = _clbench_root(args)
     _apply_text_format_override()
     max_steps = _int_env_or_arg("CODEBASE_MAX_STEPS_PER_ISSUE", args, "codebase_max_steps_per_issue", 40)
     seed = int(getattr(args, "codebase_seed", 42))
+    if task_family == "agentcl_code":
+        # AgentCL CodeEval-Pro problems (2026-09-18): same bash scaffold as
+        # codebase_adaptation (action schema, templates, submit sentinel, budget),
+        # selected per episode by metadata task_family; the episode's instance_ids
+        # are used verbatim as the stream order.
+        from src.tasks.agentcl_code.task import DEFAULT_SIF as _AGENTCL_SIF, AgentCLCodeTask
+
+        return AgentCLCodeTask(
+            instance_ids=list(instance_ids),
+            max_steps_per_issue=max_steps,
+            seed=seed,
+            sif_path=os.environ.get("AGENTCL_SIF") or _AGENTCL_SIF,
+            work_root=os.environ.get("AGENTCL_WORK_ROOT") or None,
+        )
     if split == "train":
         # 训练走 swe_bench_cl(继承 codebase, 但 django/sympy 用官方判分, 不能用 codebase 的 pytest
         # returncode 误判)。dataset 含全部 232 池 id 即可; reset 用 _schedule_instance_ids 精确取本
@@ -690,6 +704,28 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     } or bool(meta.get("no_memory"))
     if no_memory and not input.evaluation:
         raise ValueError("CODEBASE_NO_MEMORY currently supports eval-only rollouts")
+    # Single-issue GRPO baseline (2026-09-12, user-specified): skip the WRITE
+    # (memory rewrite) generation entirely. Unlike CODEBASE_NO_MEMORY this does
+    # NOT change the ACT context -- it only drops the rewrite step, so a
+    # one-issue episode becomes a plain single-problem GRPO sample. Env-gated and
+    # off by default, so live runs keep their semantics across restarts.
+    skip_write = os.environ.get("CODEBASE_SKIP_WRITE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    # Per-episode eval controls (AgentCL protocol, 2026-09-18). Absent from all
+    # training data, so training episodes are unaffected:
+    #   skip_write      -> read-only episode (memory is never rewritten)
+    #   initial_memory  -> memory the episode starts from (frozen-memory passes)
+    if meta.get("skip_write"):
+        if not input.evaluation:
+            raise ValueError("metadata skip_write is an eval-only control")
+        skip_write = True
+    initial_memory = str(meta.get("initial_memory") or "")
+    if initial_memory and not input.evaluation:
+        raise ValueError("metadata initial_memory is an eval-only control")
     rollout_id = meta.get("_eval_rollout_id", getattr(args, "alchemy_current_rollout_id", None))
     eval_dataset_name = meta.get("_eval_dataset_name")
     split = meta.get("split") or getattr(args, "codebase_split", "train")
@@ -714,10 +750,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
         )
     baselines = _load_baselines(args)
 
-    task = _make_task(args, split, order.instance_ids, order.stage_labels)
+    task = _make_task(args, split, order.instance_ids, order.stage_labels, task_family=meta.get("task_family"))
     query = await asyncio.to_thread(task.reset)
     feedback_text = None
-    memory = ""
+    memory = initial_memory
     episode_messages: list[dict[str, str]] = []
     context_truncation_count = 0
     max_context_tokens = _int_env_or_arg(
@@ -785,7 +821,8 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 turns_left = max_steps_per_issue - turn_idx
                 user_content = (
                     f"{user_content}\n\n"
-                    f"[Budget] You have {turns_left} of {max_steps_per_issue} turns remaining for this issue."
+                    f"[Budget] You have {turns_left} of {max_steps_per_issue} turns remaining for this "
+                    f"{getattr(task, 'PROMPT_UNIT', 'issue')}."
                 )
                 messages.append({"role": "user", "content": user_content})
                 trial_messages.append({"role": "user", "content": user_content})
@@ -996,7 +1033,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 "outcome": outcome,
             }
 
-            if no_memory:
+            if no_memory or skip_write:
                 trial_record["write"] = None
                 trials.append(trial_record)
                 if done or step_result is None or step_result.next_query is None:
@@ -1023,6 +1060,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 previous_memory=memory,
                 instance_messages=trial_messages,
                 v3=_write_v3,
+                prompt_set=meta.get("task_family"),
             )
             write_ids = _encode_prompt(state, write_messages, enable_thinking=True if _write_think else None)
             previous_memory = memory
@@ -1096,6 +1134,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             #   delta(缺省/空)   R(M_k)=mean(gain[k+1..])-mean(gain[..k])  —— 均值回归 bias 对照
             #   downstream        R(M_k)=reward[k+1]                        —— 裸下游, 无 format 无 delta
             #   gated_downstream  R(M_k)=format_ok*(reward[k+1]+bonus)      —— 严格 format 门控(2026-07-17)
+            #   format_only       R(M_k)=format_ok                        —— WRITE reward ablation (2026-09-03)
             _write_mode = os.environ.get("CODEBASE_WRITE_REWARD_MODE", "").strip().lower()
             rewards_seq = [float(o.get("reward", 0.0)) for o in outcomes]
             if _write_mode == "gated_downstream":
@@ -1137,6 +1176,23 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                     bonus=float(os.environ.get("CODEBASE_WRITE_FORMAT_BONUS", "0.1")),
                 )
                 _write_signal = "format_gated_windowed"
+            elif _write_mode == "format_only":
+                # WRITE reward ablation (user 2026-09-03): format gate only, no
+                # downstream term, binary. Same trained sample set as
+                # gated_windowed so the arms differ only in the reward value.
+                from examples.codebase_adaption.codebase_advantage import (
+                    format_only_rewards,
+                    memory_format_ok,
+                )
+                fmt_by_k = {
+                    int(wp["rewrite_idx"]): memory_format_ok(
+                        wp["audit"].get("memory") or "",
+                        wp["audit"].get("previous_memory") or "",
+                    )
+                    for wp in write_points
+                }
+                write_rewards = format_only_rewards(rewards_seq, fmt_by_k)
+                _write_signal = "format_only"
             elif _write_mode == "downstream":
                 # 裸下游: R(M_k)=reward[k+1]; 末位无下游则省略。GRPO 组内归一化承担难度。
                 write_rewards = {
@@ -1165,7 +1221,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 # 审计标签必须无条件刷新: :856 的初值是 delta 名字, 只在 gated 分支
                 # 刷新曾导致 downstream 组轨迹标签撒谎(2026-07-18 误报事故)
                 wp["audit"]["write_signal"] = _write_signal
-                if _write_mode in ("gated_downstream", "gated_windowed"):
+                if _write_mode in ("gated_downstream", "gated_windowed", "format_only"):
                     wp["audit"]["format_ok"] = bool(fmt_by_k.get(k))
                 sample.metadata = {
                     **meta,
@@ -1281,6 +1337,10 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             "write_audit": write_audit,
             "trials": trials,
             "act_explore": explore_by_trial,
+            "task_family": meta.get("task_family"),
+            "agentcl": meta.get("agentcl"),
+            "initial_memory": initial_memory or None,
+            "skip_write": skip_write,
         }
     )
     return GenerateFnOutput(samples=samples)

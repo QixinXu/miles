@@ -133,6 +133,32 @@ def gated_windowed_rewards(
     return out
 
 
+def format_only_rewards(
+    rewards: list[float],
+    format_ok: dict[int, bool],
+) -> dict[int, float]:
+    """WRITE reward ablation: format compliance only (user-specified 2026-09-03).
+
+    R(M_k) = 1.0 if format_ok_k else 0.0
+
+    Strips every downstream term from gated_windowed and leaves only the format
+    gate. The arm isolates what the CONTENT signal of the WRITE reward buys: if
+    it matches gated_windowed, the co-train gain came from learning to emit
+    well-formed structured memory rather than from the windowed downstream
+    delta telling the model what to write.
+
+    The reward is binary; GRPO's within-group whitening removes any scale, so no
+    bonus term is needed. The trailing write point that the other modes omit
+    (k = N-1, empty next window) is omitted here too even though format alone
+    could score it: keeping the trained sample set identical to gated_windowed
+    is what makes this a single-variable ablation.
+    """
+    out: dict[int, float] = {}
+    for k in range(len(rewards) - 1):
+        out[k] = 1.0 if format_ok.get(k) else 0.0
+    return out
+
+
 _RK_HEADER = re.compile(r"^###\s*Repository Knowledge\s*$", re.M)
 _LP_HEADER = re.compile(r"^###\s*Lessons\s*&\s*Pitfalls\s*$", re.M)
 _ANY_HEADER = re.compile(r"^###\s+.*$", re.M)
