@@ -1,0 +1,228 @@
+<title>grace12 — full-run synthesis (2026-08-05)</title>
+<style>
+:root {
+  --paper:#f6f7f5; --card:#fdfefd; --ink:#1d2422; --muted:#67716b; --line:#dde3df;
+  --accent:#0e7c6b; --accent-soft:#e2efec; --bad:#c2453a; --bad-soft:#f6e4e1;
+  --warn:#b07c1f; --warn-soft:#f3ecdb; --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --paper:#141817; --card:#1b201e; --ink:#e4e9e6; --muted:#8b968f; --line:#2c332f;
+  --accent:#41b39c; --accent-soft:#1c2f2b; --bad:#e0705f; --bad-soft:#382220;
+  --warn:#cfa04a; --warn-soft:#332b1a;
+} }
+:root[data-theme="light"] {
+  --paper:#f6f7f5; --card:#fdfefd; --ink:#1d2422; --muted:#67716b; --line:#dde3df;
+  --accent:#0e7c6b; --accent-soft:#e2efec; --bad:#c2453a; --bad-soft:#f6e4e1;
+  --warn:#b07c1f; --warn-soft:#f3ecdb;
+}
+:root[data-theme="dark"] {
+  --paper:#141817; --card:#1b201e; --ink:#e4e9e6; --muted:#8b968f; --line:#2c332f;
+  --accent:#41b39c; --accent-soft:#1c2f2b; --bad:#e0705f; --bad-soft:#382220;
+  --warn:#cfa04a; --warn-soft:#332b1a;
+}
+* { box-sizing:border-box; }
+body { background:var(--paper); color:var(--ink); font:16px/1.6 Charter,Georgia,serif;
+  margin:0 auto; max-width:60rem; padding:2.5rem clamp(1rem,4vw,3rem); }
+h1,h2,h3 { font-family:system-ui,-apple-system,sans-serif; text-wrap:balance; }
+h1 { font-size:1.65rem; margin:0 0 .2rem; }
+h2 { font-size:1.22rem; border-bottom:2px solid var(--accent); display:inline-block;
+  padding-bottom:.15rem; margin:2.4rem 0 .8rem; }
+h3 { font-size:1rem; margin:1.4rem 0 .4rem; }
+.sub { color:var(--muted); margin:0 0 1.6rem; }
+.verdict { background:var(--card); border:1px solid var(--line); border-left:4px solid var(--accent);
+  border-radius:6px; padding:1rem 1.3rem; margin:1.5rem 0; }
+.verdict h2 { border:none; margin:.1rem 0 .5rem; font-size:1.05rem; }
+table { border-collapse:collapse; font:.85rem system-ui,sans-serif; margin:.8rem 0;
+  font-variant-numeric:tabular-nums; }
+.tbl-wrap { overflow-x:auto; }
+th,td { border:1px solid var(--line); padding:.35rem .6rem; text-align:left; }
+th { background:var(--accent-soft); font-weight:600; }
+td.bad, span.bad { color:var(--bad); font-weight:600; }
+td.warn { color:var(--warn); font-weight:600; }
+td.good { color:var(--accent); font-weight:600; }
+code, .mono { font-family:var(--mono); font-size:.86em; }
+blockquote { border-left:3px solid var(--line); margin:.6rem 0 .6rem .2rem; padding:.2rem 0 .2rem .9rem;
+  color:var(--muted); font-size:.92rem; }
+blockquote code { white-space:pre-wrap; }
+.pill { display:inline-block; font:.72rem/1.6 system-ui,sans-serif; letter-spacing:.04em;
+  padding:.02rem .55rem; border-radius:99px; vertical-align:.08em; }
+.pill.bad { background:var(--bad-soft); color:var(--bad); }
+.pill.warn { background:var(--warn-soft); color:var(--warn); }
+.pill.ok { background:var(--accent-soft); color:var(--accent); }
+.note { background:var(--warn-soft); border:1px solid var(--line); border-radius:6px;
+  padding:.7rem 1rem; font-size:.9rem; margin:.8rem 0; }
+ul { padding-left:1.3rem; } li { margin:.25rem 0; }
+.src { color:var(--muted); font-size:.8rem; font-family:system-ui,sans-serif; }
+</style>
+
+<h1>grace12 — full-run synthesis</h1>
+<p class="sub">Run <code>smith-4b-v3nocurr-grace12</code> (ACT reward with <code>CODEBASE_STEP_GRACE=12</code>, otherwise
+identical to the gated arm). Consolidates seven analysis passes: early checkup (r0–63), memory-shortening
+analysis, three-era coverage audit (r8–62), close-reads of r74–78 and r90–97, ACT-quality audit r80–97,
+and the heldout-decline mechanism study. 2026-08-05, run position ≈ r97/191.</p>
+
+<div class="verdict">
+<h2>TL;DR</h2>
+<ul>
+<li><b>STEP_GRACE worked on its target and the effect held:</b> none of the old collapse precursors
+(empty commands, multi-candidate blocks, length ratchet, pervasive hallucinated tokens) recurred through r97;
+same-metric blind-submit rate <i>fell</i> (12.1% → 4.1%); train success is at its run-high (46% at r95).</li>
+<li><b>Memory shortsightedness was never fixed and has settled into a stable degenerate policy:</b>
+per-rewrite wipes are now routine (37.9% of rewrites; 22.9% with no trigger at all), repo-switch wipes remain
+structural (80.5%), and final-memory coverage is flat at <b>≈1.75/12 issues</b> — identical to the r74–78 valley.</li>
+<li><b>A brand-new failure mode appeared at r88 and is ratcheting exponentially:</b> "stall loops" — the model
+finishes (often correctly), announces completion, but never emits the submit token, burning the full 40-step budget on
+<code>exit 0</code>/<code>echo done</code>. Train-side: r88 first case → r95 5.7% → r96 7.3% → <span class="bad">r97 18.2%</span>.
+This is the most urgent live signal in the run.</li>
+<li><b>The "heldout crash to 1/30" is mostly noise plus that new failure mode</b> — and the scarier-looking
+20→1 collapse I reported earlier was a units error on my side (see correction below). The real curve peaked at
+6/30 and lives in a 2–5/30 noise band; r95's 1/30 got a direct push from 3 stall-loop trials landing on the only
+solvable instances.</li>
+<li><b>Slow variable behind the low ceiling:</b> verification depth collapsed (looked at test files before
+submitting: 80% → 30%; real verification pytest/repro: 44% → 22%) — the step-regret reward keeps paying for
+"guess a patch, fake-verify with <code>python&nbsp;-c</code>, submit fast".</li>
+</ul>
+</div>
+
+<div class="note"><b>Correction (my error, not the agents'):</b> the heldout curve I had been reporting
+(10, 10, 3, 20, 17, …) mixed units — early points were success <i>percentages</i>, late points raw
+<i>counts</i>. The verified curve in solved-count/30 is:
+<b>3, 3, 1, 6 (r31 peak), 5, 3, 3, 4, 5, 2, 4, 1 (r95)</b>. Also note the heldout set is only
+<b>6 unique instances × 5 attempts</b>, and 3 of the 6 have never been solved at any point — scores are
+essentially coin flips over 3 marginal instances. Read per-instance splits, not the headline number.</div>
+
+<h2>1. Run status &amp; ops timeline</h2>
+<ul>
+<li>Position ≈ <b>r97/191</b>; latest checkpoint <code>iter_0000095</code>; 13 crashes and recoveries so far.</li>
+<li>Crashes 1–10 were the known Ray-infrastructure family (silent UNREACHABLE / ActorUnavailable). The
+acceleration to sub-hour intervals on 08-04/05 had a mundane root cause: <b>flame-31's 5.9 TB /tmp hit 100%</b>
+(Ray spill + traj + ckpt writes all failing). Freed 2.5 TB by deleting verified-backed-up local copies of the
+<code>v3nocurr-gated</code> run (HF: 18 ckpts iter_7–143 + /project traj) and the <code>v3curr-grace12</code>
+ckpts (HF: 21 ckpts iter_7–119; its traj kept locally). Disk now 57%; post-cleanup stability back to baseline.</li>
+<li>Monitoring hardened after one missed crash: primary criterion is now <b>GPU VRAM sum</b> (zero = dead,
+unspoofable), secondary is trajectory-file freshness (&gt;45 min stall = hung-with-memory), log text demoted to
+reference only (the supervisor's reconnect spam once kept the log mtime fresh through a 30-min outage).</li>
+</ul>
+
+<h2>2. What STEP_GRACE fixed — and what it didn't (ACT side)</h2>
+<p class="src">Sources: early checkup (r0–63); ACT-quality audit r80/85/90/95/96/97 vs r30/38, 1152 + 384 trials, uniform metrics.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Metric (train)</th><th>early r30/38</th><th>late r80–97</th><th>verdict</th></tr>
+<tr><td>Empty-command turn rate</td><td>1.23%</td><td>2.05%</td><td class="good">in band — no relapse</td></tr>
+<tr><td>Multi-candidate code blocks</td><td>0.21%</td><td>0.39%</td><td class="good">in band</td></tr>
+<tr><td>Chars/turn (length ratchet)</td><td>633</td><td>695 (592–766)</td><td class="good">no ratchet</td></tr>
+<tr><td>Hallucinated tokens</td><td>12.5/rollout</td><td>~122/rollout</td><td class="warn">10× but concentrated: 285/324 of r85's from a single degenerate turn; r95/r97 ≈ 0. New "sticky <code>&lt;tool_call&gt;</code> prefix" variant on astroid instances — parseable, not spreading</td></tr>
+<tr><td>Blind-submit rate (same wide metric)</td><td>12.1%</td><td>4.1%</td><td class="good">improved</td></tr>
+<tr><td>Real verification before submit (pytest/repro)</td><td>44.1%</td><td>21.8%</td><td class="bad">halved — replaced by <code>python -c</code> one-liners (62.7%) and "ran only the patch script" (11.5%)</td></tr>
+<tr><td><b>Stall-loop rate</b> (full 40 turns, ends in ≥3 no-op turns, never submits)</td><td>0.0%</td><td class="bad">r88 first case → 5.7% → 7.3% → <b>18.2% (r97)</b></td><td class="bad">new, exponential ratchet</td></tr>
+<tr><td>Train success rate</td><td>22.1%</td><td>33.1% (peak 46.4% @r95, back to 24.5% @r97 as stalls bite)</td><td class="warn">gains now being eaten by stalls</td></tr>
+</table></div>
+
+<h3>The stall loop, in one case</h3>
+<blockquote><code>t10 THOUGHT: "The fix has been implemented and verified... wait_exponential_jitter now properly supports timedelta"
+CMD: echo "ALL DONE"
+t20–t39: exit 0 · exit 0 · exit 0 · ... (≈30 consecutive no-op turns)
+→ Max steps (40) reached · eval_status=None · reward=0</code></blockquote>
+<p>The model <i>knows</i> it is done (thoughts stay coherent) but no longer retrieves the
+<code>COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT</code> action — a protocol-level forgetting. The single heldout pass at
+r95 came from a trial that drifted into the same "announce completion" groove and self-corrected one turn before
+budget death. <b>Hypothesis to check in the reward code: submitting-and-failing and never-submitting may both earn
+reward 0, in which case "don't submit when unsure" is a regret-avoiding strategy RL can learn.</b></p>
+
+<h2>3. Heldout decline: mechanism, not mystery</h2>
+<p class="src">Source: heldout mechanism study — all 12 eval points, 360 trials, per-turn close reads of r31-vs-r95 pairs.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Behavioral metric (heldout)</th><th>r31 (peak, 6/30)</th><th>r79–95 (2–4–1/30)</th></tr>
+<tr><td>Median steps of <i>failing</i> submissions</td><td>24</td><td class="bad">9–10</td></tr>
+<tr><td>Fast-and-wrong submissions (≤12 steps)</td><td>11%</td><td class="bad">67–90%</td></tr>
+<tr><td>Looked at test files before submitting</td><td>80%</td><td class="bad">30%</td></tr>
+<tr><td>Whole-file heredoc rewrites</td><td>23%</td><td class="warn">27–43%</td></tr>
+<tr><td>Stall-loop trials</td><td>0</td><td class="bad">3 (r95 only — first eval point ever)</td></tr>
+</table></div>
+<p>Representative pair (tablib-595, ODS export): at r31 the agent ran a 7-round
+edit→pytest→read-failure→edit loop and submitted only after "All 6 ODS tests pass" (39 steps, PASS). At r95 the
+same instance got a heredoc patch verified by <code>grep</code>-ing its own edit, zero pytest, zero test-file reads,
+submitted at step 5 (FAIL). Localization was instant and correct both times — <b>what died is the verify–iterate
+loop, not code understanding</b>. Environment issues excluded (1 timeout in 360 trials); reasoning-length blowup
+excluded (thought lengths flat, zero context truncations).</p>
+
+<h2>4. Memory: shortsightedness is now the steady state</h2>
+<p class="src">Sources: three-era coverage audit (r8–62), close-reads r74–78 (9 episodes) and r90–97 (24 episodes precision-read,
+128 auto-scanned, identical recomputed metrics). Era case viewer: <code>notes/grace12_era_cases.html</code>.</p>
+<div class="tbl-wrap"><table>
+<tr><th>Metric</th><th>early r8–16</th><th>r74–78</th><th>r90–97</th></tr>
+<tr><td>Line-level wipe rate (rewrite keeps &lt;30% of old lines)</td><td>≈0.7% of rewrites (audit metric)</td><td>50.3%</td><td>37.9%</td></tr>
+<tr><td>Repo-switch wipe (first write in new repo clears old repo)</td><td>rare</td><td>82.5%</td><td>80.5%</td></tr>
+<tr><td>No-trigger wipes (after a <i>success</i>, same repo)</td><td>—</td><td>—</td><td class="bad">22.9% of all wipes</td></tr>
+<tr><td>Final coverage (strict: path+bug-pattern trace of issue i survives in M_final)</td><td>≈8.26/12</td><td>1.73/12</td><td>1.75/12</td></tr>
+<tr><td>Mid-episode peak coverage (same strict metric)</td><td>—</td><td>2.71 (max 6)</td><td>2.41 (max 7)</td></tr>
+<tr><td>Garbled-token episodes (CJK/Cyrillic in English memory)</td><td>0</td><td>8.8%</td><td class="bad">15.6% (Cyrillic first appeared: "Rізнительна", "обаче")</td></tr>
+<tr><td>"full test suite" boilerplate in snapshots</td><td>low</td><td>30.8%</td><td>31.4%</td></tr>
+</table></div>
+<p>Interpretation: the WRITE policy has converged to <b>"one-issue scratchpad, rewritten per issue"</b>. The apparent
+wipe-rate improvement (50%→38%) bought nothing — coverage is unchanged because what survives is boilerplate and
+current-issue text, not cross-issue knowledge. Occasional two-repo structured memories appear after successes
+(4 sightings in r90–97) but none survived the next failure. Note: the earlier "mid-episode 12/12 coverage" claim
+from the r74–78 read does not reproduce under the strict survives-to-snapshot metric (max=6); treat the strict
+numbers as canonical.</p>
+
+<h3>New memory-side pathologies (all first seen in r90–97)</h3>
+<ul>
+<li><span class="pill bad">repeat spam</span> ep_1507 t11: two "Key file for debugging…" lines alternated 44+
+times until token truncation — written after a <i>reward=1 success</i>, i.e. RL will reinforce it. One case now; watch it.</li>
+<li><span class="pill bad">meta leakage</span> 7/128 episodes copied the rewrite instruction itself into memory
+("The task explicitly demands that I stop all current interactions and rewrite the memory…").</li>
+<li><span class="pill warn">fabricated knowledge</span> invented eval rules ("final output must contain only the
+three allowed sections" — no such rule), invented failure causes ("hidden binary file signature mismatch"),
+path-level drift (a function relocated to a file it never lived in).</li>
+<li><span class="pill warn">sibling homogenization</span> r97 group 194: three siblings' memories nearly identical —
+within-group variance (the GRPO signal source) is compressing.</li>
+<li><span class="pill warn">memory–behavior dissociation</span> a trial whose memory_in correctly warned
+"check that the replacement string exactly matches the target" then produced exactly that no-op-replace failure.</li>
+</ul>
+
+<h2>5. Synthesis: what the grace12 arm has proven</h2>
+<ul>
+<li><b>Proven (positive):</b> pricing ACT steps with a 12-step grace window durably removed the efficiency-collapse
+precursors and improved train success — the ACT-side fix is real and stable for ~100 rollouts.</li>
+<li><b>Proven (negative):</b> next-trial-only WRITE pricing (gated_downstream) cannot maintain cross-issue memory,
+under any ACT regime — coverage sits at ~2/12 regardless. This is the direct motivation for the memwin3 arm
+(windowed Δ pricing, now running on babel) and the explore arm (judge penalizes wipes; queued as Slurm 129637).</li>
+<li><b>New and unresolved:</b> late-stage continual RL is now eroding <i>protocol</i> behaviors (submission token,
+memory-format adherence) and <i>text integrity</i> (garbling, repeat spam) — failure modes none of the earlier arms
+lived long enough to show. The stall-loop ratchet (18.2% at r97) will dominate both train and heldout numbers within
+~10 rollouts if it continues.</li>
+<li><b>Reward-design leads worth auditing now:</b> (a) submit-and-fail vs never-submit may be reward-equivalent —
+if so, stalls are rational regret avoidance; (b) step-regret pressure demonstrably pays for skipping verification —
+grace12 softened the per-step penalty but the residual pressure still selects the fast-guess strategy on heldout-difficulty tasks.</li>
+</ul>
+
+<h2>6. Updated sentinel watchlist</h2>
+<div class="tbl-wrap"><table>
+<tr><th>Sentinel</th><th>Current value</th><th>Alarm condition</th></tr>
+<tr><td><b>Stall-loop rate</b> (per rollout)</td><td class="bad">18.2% (r97)</td><td>any further rise; ≥25% = intervention discussion</td></tr>
+<tr><td>Repeat-spam lines (memory, ×≥10)</td><td>1 case</td><td>any recurrence</td></tr>
+<tr><td>Meta-leakage episodes</td><td>7/128</td><td>&gt;10%</td></tr>
+<tr><td>Non-ASCII (CJK+Cyr) episode rate</td><td>15.6%</td><td>&gt;20% or Cyrillic spreading</td></tr>
+<tr><td>WRITE response_tokens</td><td>(leading indicator, ~10 rollouts ahead of memory length)</td><td>renewed collapse toward ~290</td></tr>
+<tr><td>Empty-command rate / chars-per-turn</td><td class="good">in band</td><td>actonly-style ratchet</td></tr>
+<tr><td>Heldout (report per-instance!)</td><td>1/30 (628: 1/5, 613: 0/5, 595: 0/5)</td><td>628 hitting 0/5 twice in a row</td></tr>
+</table></div>
+
+<h2>7. Open decisions (for qixinx)</h2>
+<ul>
+<li><b>grace12 stop/continue:</b> scientific conclusions are essentially complete (§5). Continuing mainly
+observes the stall-loop ratchet's endgame — which has some standalone value as a new-pathology natural experiment,
+but costs the node the queued explore arm is waiting for (129637 blocked on MaxNodePerAccount).</li>
+<li><b>Submission-reward audit:</b> quick code read of the reward for submit-fail vs never-submit; if equivalent,
+a small negative on never-submitting is a candidate fix for any future arm.</li>
+<li><b>Heldout redesign:</b> 6 instances × 5 attempts is too narrow; 3 instances are dead weight (never solved).
+Widen the set and report per-instance.</li>
+<li><b>actonly ckpt offline evals:</b> 16 ckpts (iter_7–127) on HF have never had post-hoc probe evals
+(the eval-iter47/119-style runs); needs a GPU slot and a task-set decision.</li>
+</ul>
+
+<p class="src">Companion artifacts: era case viewer (<code>grace12_era_cases.html</code>), gated drift viewer,
+memory-function viewer, reward-decomposition plot. All numbers in this synthesis recomputed with uniform metric
+definitions; where an older claim did not reproduce under the strict metric, the strict number is stated and the
+discrepancy noted inline.</p>
