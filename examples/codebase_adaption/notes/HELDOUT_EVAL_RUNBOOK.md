@@ -41,7 +41,7 @@
 └── seq/                       # sequence 与题目 registry
     ├── FINAL_2x13_26issues.jsonl
     ├── FINAL_3x9_27issues.jsonl
-    └── heldout_registry.jsonl   # 1,611 题;CODEBASE_EVAL_DATASET 指的就是它
+    └── heldout_registry.jsonl   # 1,611 题全量(62MB,没进 git);只跑这四条 sequence 用仓库里的 registry_heldout97.jsonl 就行
 ```
 
 同一份 registry / sequence 也在 `/data/group_data/rl/yuxiaoq/qixinx/swe_smith/heldout_v4/`。
@@ -56,28 +56,35 @@ cd ~/miles && git checkout -b heldout racktic/swecl-actthink-scaffold   # 这条
 git clone git@github.com:Racktic/continual-learning-bench.git ~/continual-learning-bench   # main 即可,含 swe_smith 任务本体
 ```
 
-held-out 的评测脚本、`ho_*.jsonl` 评测数据、两个补丁都**已经在这条分支里**(`examples/codebase_adaption/{scripts,data,patches/heldout}`),clone 完只需要做第 3 节的改路径。
+held-out 的评测脚本、`ho_*.jsonl` 评测数据、两个补丁都**已经在这条分支里**(`examples/codebase_adaption/{scripts,data,patches/heldout}`),clone 完只需要做第 2 步(打补丁)和第 3 节的改路径。
 sequence 本体 + 题目 registry 在 clbench 仓库 `data/swe_smith/heldout_v4/`,题目镜像和权重见第 4 节。
 
 ---
 
-## 2. 代码里已经带好的两处 babel 修复(不用自己打补丁)
+## 2. 必须打的补丁(★ 不打则 stateless 全部失败)
 
-这两处都在分支的 `codebase_rollout.py` 里,提一下是因为它们影响行为:
+分支上 `examples/codebase_adaption/codebase_rollout.py:781` 是:
 
-1. **thinking + 无记忆的守卫放宽到"只拒绝多题 episode"。** 老版本是 `if act_think and no_memory: raise`,
-   而我们的 stateless 就是 ACT thinking + 无记忆跑的,不放宽一条都跑不了。单题 episode 安全:
-   守卫防的是 `_encode_prompt_with_fifo` 的上下文裁剪与 thinking 的 append-only token 缓冲冲突,
-   而只有多题 ICL episode 才跨题累积上下文;单题上限 40 轮,实测最大 `context_tokens` 46,568 对
-   240,000 预算,`context_truncation_count` 全程 0。
-2. **agent 命令 stdout 有界捕获**(head 1MB + tail 1MB,判分/setup 命令全量不受影响)。
-   不加的话某些题一条 `find /` 就能把宿主内存打爆;判分结果逐字节不变。
+```python
+if act_think and no_memory:
+    raise ValueError("CODEBASE_ACT_THINKING is not supported together with CODEBASE_NO_MEMORY")
+```
+
+我们的 stateless 是 **ACT thinking + 无记忆**跑的,会直接撞这个 raise。补丁把它改成**只拒绝多题 episode**:
+
+```bash
+cd ~/miles && git apply examples/codebase_adaption/patches/heldout/01-thinking-no-memory-guard.diff
+```
+
+为什么单题安全:这个守卫防的是 `_encode_prompt_with_fifo` 的上下文裁剪与 thinking 的 append-only token 缓冲冲突,而**只有多题 ICL episode 才会跨题累积上下文**。单题 episode 上限 40 轮,实测最大 `context_tokens` 46,568 对 240,000 预算,`context_truncation_count` 全程 0。
+
+第二个补丁 `patches/heldout/02-cmd-stdout-cap.diff` 是 agent 命令 stdout 的有界捕获(head 1MB + tail 1MB,判分/setup 命令全量不受影响)。babel 上不打会有宿主 OOM 风险(某些题 `find /` 之类输出能打爆内存),判分结果不受影响。**建议打。**
 
 ---
 
 ## 3. 拷文件 + 改路径(代码里写死的是我的账号)
 
-脚本、数据、代码修复都在仓库里了,只有出表脚本 `report_tables.py` 在交接包里(`$K/report_tables.py`,`K=/data/group_data/rl/yuxiaoq/qixinx/heldout_eval_kit`)。
+脚本和数据都在仓库里了,只有出表脚本 `report_tables.py` 在交接包里(`$K/report_tables.py`,`K=/data/group_data/rl/yuxiaoq/qixinx/heldout_eval_kit`)。
 
 然后按下表改 6 处(都是写死的绝对路径,`YOU` = 你的用户名):
 
@@ -87,7 +94,7 @@ sequence 本体 + 题目 registry 在 clbench 仓库 `data/swe_smith/heldout_v4/
 | 同上 | 16 | `CKROOT=/data/group_data/rl/yuxiaoq/qixinx/agentcl/ckpt` | 被测 ckpt 的根目录(见第 4 节) |
 | 同上 | 17 | `RUNROOT=/data/group_data/rl/.../codebase_adaption_runs` | 你自己的轨迹根目录(**要可写**) |
 | `scripts/eval_heldout_longseq.sh` | 26–27 | `CODEBASE_HF_CKPT` / `CODEBASE_TORCH_DIST` 指向 `/data/user_data/qixinx/...` | 你能读的 Qwen3.5-4B / torch_dist(见第 4 节) |
-| 同上 | 55 | `CODEBASE_EVAL_DATASET` 默认 `/data/user_data/qixinx/swe_smith/heldout_v4/heldout_registry.jsonl` | `/data/group_data/rl/yuxiaoq/qixinx/swe_smith/heldout_v4/heldout_registry.jsonl`(或直接用环境变量覆盖,不改文件) |
+| 同上 | 55 | `CODEBASE_EVAL_DATASET` 默认 `/data/user_data/qixinx/swe_smith/heldout_v4/heldout_registry.jsonl`(我的私有目录) | clbench 仓库里的 `data/swe_smith/heldout_v4/registry_heldout97.jsonl`(四条 sequence 用到的 97 道题,2.3MB,已进 git),或 group_data 上的全量 `heldout_registry.jsonl`(1,611 题,62MB,没进 git)。这是 `${VAR:-}`,可以直接 export 覆盖不改文件 |
 | 同上 | 79 / `eval_heldout_api.sh` 21 | `NODE_RUN_DIR` / `OUT` 里的 runs 根目录 | 同 `RUNROOT` |
 | `scripts/eval_heldout_api.sh` | 55、57、60 | `/home/qixinx/miles`、读我的 `.env` | 你的 miles 路径、你自己的 `OPENAI_API_KEY` |
 | `scripts/cluster_babel_env.sh` | 10、18、20 | miles SIF / HF ckpt / torch_dist 在 `/data/user_data/qixinx` | 你能读的副本(第 4 节) |
@@ -104,7 +111,7 @@ group 可读(直接用):
 | 东西 | 路径 |
 |---|---|
 | 题目 SIF 库(含 held-out 12 个 repo) | `/data/group_data/rl/yuxiaoq/qixinx/swesmith_sifs` |
-| sequence + registry | `/data/group_data/rl/yuxiaoq/qixinx/swe_smith/heldout_v4/` |
+| sequence + 全量 registry(1,611 题) | `/data/group_data/rl/yuxiaoq/qixinx/swe_smith/heldout_v4/` —— 四条 sequence 和 97 题的精简 registry 已经在 clbench 仓库 `data/swe_smith/heldout_v4/` 里,一般用仓库那份就够 |
 | 交接包 | `/data/group_data/rl/yuxiaoq/qixinx/heldout_eval_kit/` |
 | 被测 ckpt(torch_dist) | `/data/group_data/rl/yuxiaoq/qixinx/agentcl/ckpt/<tag>/ckpt`,现有 tag:`qwen35-4b-base`、`explore-fmtonly-scaffoldv2-ACTthinking-iter191`、`explore-gwin-think-iter251`、`actonly-think-iter239` |
 
