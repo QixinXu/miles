@@ -17,6 +17,12 @@ Trajectories are written in the miles eval format, one JSON per episode, so
 agentcl_metrics.py reads them unchanged. Finished episodes are skipped on
 re-run (resume).
 
+--task swe_smith (2026-09-22) runs the held-out SWE-smith sequences instead:
+the task is built by codebase_rollout._make_task exactly as the miles eval
+does (CODEBASE_EVAL_TASK=swe_smith + --eval-dataset registry), and episodes
+with metadata no_memory get the miles stateless path (bare issue prompt, no
+WRITE). --n-samples repeats every row (avg@N for stateless).
+
 Run inside the miles SIF (imports miles + clbench), e.g.
   python run_api_agentcl.py --data stage1.jsonl --out <traj dir> --model gpt-5.5
 Needs OPENAI_API_KEY in the environment.
@@ -33,6 +39,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, "/home/qixinx/miles")
 CLBENCH_ROOT = os.environ.setdefault("CLBENCH_ROOT", "/home/qixinx/continual-learning-bench")
@@ -80,21 +87,33 @@ async def chat(client: AsyncOpenAI, args, messages: list[dict], *, max_tokens: i
 async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
     """One eval episode; mirrors codebase_rollout.generate for evaluation=True."""
     skip_write = bool(meta.get("skip_write"))
+    no_memory = bool(meta.get("no_memory"))
     memory = str(meta.get("initial_memory") or "")
     max_steps = args.max_steps
-    task = AgentCLCodeTask(
-        instance_ids=list(meta["instance_ids"]),
-        max_steps_per_issue=max_steps,
-        work_root=args.work_root,
-    )
+    if args.task == "swe_smith":
+        task = cr._make_task(
+            SimpleNamespace(codebase_max_steps_per_issue=max_steps),
+            str(meta.get("split") or "heldout"),
+            list(meta["instance_ids"]),
+            list(meta["stage_labels"]),
+            task_family=meta.get("task_family"),
+        )
+    else:
+        task = AgentCLCodeTask(
+            instance_ids=list(meta["instance_ids"]),
+            max_steps_per_issue=max_steps,
+            work_root=args.work_root,
+        )
     query = await asyncio.to_thread(task.reset)
     feedback_text = None
+    episode_messages: list[dict] = []
     outcomes, trials, summaries, write_audit = [], [], [], []
     try:
         while query is not None:
             trial_pos = int((query.metadata or {}).get("active_issue_index", len(outcomes)))
             instance_id = str(query.instance_id)
-            messages: list[dict] = []
+            # no_memory (stateless) keeps one context across the episode, as in miles
+            messages: list[dict] = episode_messages if no_memory else []
             trial_messages: list[dict] = []
             transcript: list[dict] = []
             memory_in = memory
@@ -106,7 +125,11 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
                     fb = {"role": "user", "content": f"FEEDBACK: {feedback_text.strip()}"}
                     messages.append(fb)
                     trial_messages.append(dict(fb))
-                user_content = build_act_user_content(memory=memory, query_prompt=query.prompt, include_memory=first_turn)
+                if no_memory:
+                    user_content = query.prompt or "(no content)"
+                else:
+                    user_content = build_act_user_content(memory=memory, query_prompt=query.prompt,
+                                                          include_memory=first_turn)
                 user_content = (
                     f"{user_content}\n\n"
                     f"[Budget] You have {max_steps - turn_idx} of {max_steps} turns remaining for this "
@@ -124,7 +147,7 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
                 obs = step_result.observation
                 transcript.append({
                     "step": len(transcript),
-                    "user": user_content if len(transcript) == 0 else None,
+                    "user": user_content,
                     "assistant": act_text,
                     "action": cr._jsonable(action),
                     "act_finish": act_finish,
@@ -132,7 +155,7 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
                     "instance_complete": bool(obs.instance_complete),
                 })
                 if step_result.done or obs.instance_complete or step_result.next_query is None:
-                    feedback_text = None
+                    feedback_text = obs.content if no_memory else None
                     exhausted = False
                     break
                 feedback_text = obs.content
@@ -152,6 +175,7 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
                 query = step_result.next_query
             if exhausted and step_result is not None and not step_result.observation.instance_complete:
                 step_result = cr._force_complete_current_issue(task, max_steps_per_issue=max_steps)
+                feedback_text = step_result.observation.content if no_memory else None
 
             oo = step_result.instance_outcome if step_result is not None else None
             outcome = {
@@ -164,10 +188,12 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
                 "trial_pos": trial_pos,
             }
             outcomes.append(outcome)
-            trial = {"trial_pos": trial_pos, "instance_id": outcome["instance_id"], "memory_in": memory_in,
+            labels = meta.get("stage_labels") or []
+            trial = {"trial_pos": trial_pos, "instance_id": outcome["instance_id"],
+                     "stage": labels[trial_pos] if trial_pos < len(labels) else None, "memory_in": memory_in,
                      "turns": transcript, "outcome": outcome, "write": None}
 
-            if not skip_write:
+            if not (skip_write or no_memory):
                 final_fb = (step_result.observation.content or "").strip() if step_result is not None else ""
                 if final_fb:
                     trial_messages.append({"role": "user", "content": f"FEEDBACK: {final_fb}"})
@@ -185,7 +211,8 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
 
             if step_result is None or step_result.done or step_result.next_query is None:
                 break
-            feedback_text = None
+            if not no_memory:
+                feedback_text = None
             query = step_result.next_query
     except Exception as exc:
         print(f"[episode {ep_index}] ABORTED: {exc}\n{traceback.format_exc()}", flush=True)
@@ -205,6 +232,9 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
         "instance_ids": meta.get("instance_ids"),
         "stage_labels": meta.get("stage_labels"),
         "skip_write": skip_write,
+        "no_memory": no_memory,
+        "split": meta.get("split"),
+        "order_seed": meta.get("order_seed"),
         "initial_memory": meta.get("initial_memory") or None,
         "max_steps_per_issue": max_steps,
         "outcomes": outcomes,
@@ -215,10 +245,16 @@ async def run_episode(client, args, meta: dict, ep_index: int) -> dict:
 
 
 async def main_async(args) -> None:
+    if args.task == "swe_smith":
+        # read by codebase_rollout._make_task (eval branch), same as the miles eval
+        os.environ["CODEBASE_EVAL_TASK"] = "swe_smith"
+        os.environ["CODEBASE_EVAL_DATASET"] = args.eval_dataset
     cr._apply_text_format_override()
     rows = [json.loads(line) for line in open(args.data)]
     if args.limit:
         rows = rows[: args.limit]
+    # --n-samples: row i, sample k -> episode i * n + k
+    rows = [r for r in rows for _ in range(args.n_samples)]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     client = AsyncOpenAI(timeout=args.api_timeout, max_retries=0)
@@ -262,6 +298,10 @@ def main() -> None:
     ap.add_argument("--api-timeout", type=float, default=600.0)
     ap.add_argument("--work-root", default=None)
     ap.add_argument("--limit", type=int, default=0, help="only the first N rows (pilot)")
+    ap.add_argument("--task", choices=("agentcl_code", "swe_smith"), default="agentcl_code")
+    ap.add_argument("--eval-dataset", default="/data/user_data/qixinx/swe_smith/heldout_v4/heldout_registry.jsonl",
+                    help="--task swe_smith: instance registry (CODEBASE_EVAL_DATASET)")
+    ap.add_argument("--n-samples", type=int, default=1, help="episodes per row (4 = avg@4 stateless)")
     asyncio.run(main_async(ap.parse_args()))
 
 
