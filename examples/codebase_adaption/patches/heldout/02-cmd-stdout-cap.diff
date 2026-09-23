@@ -1,0 +1,161 @@
+diff --git a/examples/codebase_adaption/codebase_rollout.py b/examples/codebase_adaption/codebase_rollout.py
+index 35a306bd8a..091c66f4b7 100644
+--- a/examples/codebase_adaption/codebase_rollout.py
++++ b/examples/codebase_adaption/codebase_rollout.py
+@@ -283,6 +283,148 @@ def _apply_text_format_override() -> None:
+     print("[codebase_rollout] ACT output format = plain text (bash code block); JSON schema disabled", flush=True)
+ 
+ 
++# ── agent 命令 stdout 内存上限(2026-07-22, babel host RAM OOM 修复)──────────────
++# 根因(见 notes/BABEL_STDOUT_OOM_FIX.md): clbench 的 container_backend._run_process_tree 用
++# subprocess.communicate() 把命令 stdout **全量**读进 RolloutManager 进程, 只有超时、无字节上限。
++# django/sympy 等大 repo 的 agent 探索命令(pytest/grep -r/find/build)单条能吐几十 MB~GB, 16 个
++# 并发 episode 同时灌 → RolloutManager RSS 无界棘轮式增长, 打爆 host RAM 被 SLURM oom_kill(2TB 亦然)。
++# 对照: swe-smith 小合成 repo 输出 KB 级, RolloutManager 恒定 ~22G 不涨。故是命令输出体量, 非 thinking。
++#
++# 修复(纯 miles 侧运行时 monkeypatch, 与上面 _apply_text_format_override 同手法, clbench 文件零改动):
++# 只对 **agent 探索命令**(execute 路径, cmd 以 ["bash","-c",...] 结尾)做 head+tail 有界捕获;
++# **判分/setup 命令**(singularity_exec 路径, ["/bin/bash","-lc",...])一律委托原函数全量捕获
++# —— 因为 swecl 官方判分 grade_log() 要 parse 完整 pytest stdout, 判分绝不能截。
++#
++# 结果保真(硬要求: 不改变模型看到的输出、不影响判分):
++#  1. 判分: 走 /bin/bash -lc, 完全委托原函数 → 判分命令 stdout 逐字节不变 → 分数不变。
++#  2. returncode: agent 命令读到 EOF(drain 丢弃中段, **不提前 kill**) 再 proc.wait() → returncode
++#     与原来相同(观测里的 <returncode> 不变)。超时路径与原函数一致(killpg + 抛 TimeoutExpired)。
++#  3. 模型观测: 观测模板(mini-swe-agent default.yaml)对 >10000 字符只显示 head[:5000]+tail[-5000:]
++#     + "N characters elided"。有界捕获返回的 _CappedStdout 的 [:5000]/[-5000:] 走真实 head/tail(各留
++#     1MB≫5000), __len__ 返回真实总长 N ⇒ elided 计数 = N-10000 亦真实。经离线测试(test_capped_stdout.py,
++#     空/小/中/2MB/50MB/300MB 六档)验证: 观测模板输出与全量捕获 **逐字节相同**, trace 的 [:2000] 亦相同。
++#     输出 ≤ head+tail(2MB, 绝大多数命令)时返回普通完整 str, 行为与原函数完全一致。
++import subprocess as _subprocess
++import signal as _signal
++import threading as _threading
++from collections import deque as _deque
++
++_CMD_STDOUT_HEAD = int(os.environ.get("CODEBASE_CMD_STDOUT_HEAD_BYTES", 1 << 20))  # 1MB
++_CMD_STDOUT_TAIL = int(os.environ.get("CODEBASE_CMD_STDOUT_TAIL_BYTES", 1 << 20))  # 1MB
++# opt-in(默认关): agent 命令的地址空间上限(KB, ulimit -v)。drgrpo-r2 在 eps18/19 处
++# 模型稳定写出 30-40GB 级内存炸弹脚本(fix.py/test_bs.py/test_bresenham.py), 两次把
++# 755G 节点打到 Ray 95% 阈值 OOM 循环(2026-07-24)。加 cap 后炸弹进程收到 MemoryError
++# 死在容器里(agent 可见的真实反馈), 节点保命。合法 swe-smith 测试用量 <1G, 不受影响。
++_CMD_MEM_LIMIT_KB = int(os.environ.get("CODEBASE_CMD_MEM_LIMIT_KB", "0"))
++# opt-in(默认关): 判分/setup 命令(bash -lc 路径)的地址空间上限。fork63 三次死于同一位置:
++# astroid instance 判分跑 test_protocols.py::test_assign_stmts_starred_fails, 带 bug/补丁时
++# 推理组合爆炸, 每个判分进程恒定 ~101.76G, 3 个 sibling 并发判分即打爆 755G 节点(2026-07-26)。
++# 合法测试套件 <2G; 把套件跑爆的补丁在 cap 下得 MemoryError→tests_failed=正确语义。
++_GRADE_MEM_LIMIT_KB = int(os.environ.get("CODEBASE_GRADE_MEM_LIMIT_KB", "0"))
++_ORIG_RUN_PROCESS_TREE = None  # patch 时保存原函数, 判分/setup 命令委托它
++class _CappedStdout(str):
++    """内容只存 head+tail(有界), 但 __len__ 报告真实总长 N。
++    切片 [:k]/[-k:] 走 str 的 C 级实现(按真实存储的 head+tail 取)⇒ head/tail 保真;
++    __len__ 覆盖为 N ⇒ 观测模板的 |length 分支判断与 "N characters elided" 计数保真。
++    下游对该串只有观测模板的 [:5000]/[-5000:]/|length 与 trace 的 [:2000](均落在 head 内),
++    不访问中段, 故安全。"""
++
++    def __new__(cls, head: str, tail: str, total_len: int):
++        obj = super().__new__(cls, head + tail)
++        obj._true_len = total_len
++        return obj
++
++    def __len__(self) -> int:
++        return self._true_len
++
++
++def _run_process_tree_capped(cmd, *, timeout):
++    """替代 container_backend._run_process_tree: 仅 agent 命令(bash -c)有界捕获, 其余委托原函数。"""
++    is_agent = len(cmd) >= 3 and cmd[-3] == "bash" and cmd[-2] == "-c"
++    if not is_agent:
++        if (
++            _GRADE_MEM_LIMIT_KB > 0
++            and len(cmd) >= 3
++            and str(cmd[-3]).endswith("bash")
++            and cmd[-2] in ("-lc", "-c")
++        ):
++            cmd = list(cmd[:-1]) + [f"ulimit -v {_GRADE_MEM_LIMIT_KB} 2>/dev/null; " + cmd[-1]]
++        return _ORIG_RUN_PROCESS_TREE(cmd, timeout=timeout)
++    if _CMD_MEM_LIMIT_KB > 0:
++        cmd = list(cmd[:-1]) + [f"ulimit -v {_CMD_MEM_LIMIT_KB} 2>/dev/null; " + cmd[-1]]
++    proc = _subprocess.Popen(
++        cmd, text=True, encoding="utf-8", errors="replace",
++        stdout=_subprocess.PIPE, stderr=_subprocess.STDOUT, start_new_session=True,
++    )
++    buf = ""           # 未超 head+tail 前累积完整输出(超了才切 head/tail)
++    total = 0
++    capped = False
++    head = ""
++    tail_chunks: "_deque[str]" = _deque()
++    tail_size = 0
++
++    def _push_tail(s: str) -> None:
++        nonlocal tail_size
++        tail_chunks.append(s)
++        tail_size += len(s)
++        while tail_chunks and tail_size - len(tail_chunks[0]) >= _CMD_STDOUT_TAIL:
++            tail_size -= len(tail_chunks.popleft())
++
++    def _reader() -> None:
++        nonlocal buf, total, capped, head
++        try:
++            while True:
++                chunk = proc.stdout.read(65536)
++                if not chunk:
++                    break
++                total += len(chunk)
++                if not capped:
++                    buf += chunk
++                    if len(buf) > _CMD_STDOUT_HEAD + _CMD_STDOUT_TAIL:
++                        capped = True
++                        head = buf[:_CMD_STDOUT_HEAD]
++                        _push_tail(buf[_CMD_STDOUT_HEAD:])
++                        buf = ""  # 释放, 之后只留 head + 尾环形缓冲
++                else:
++                    _push_tail(chunk)
++        except Exception:
++            pass
++
++    t = _threading.Thread(target=_reader, daemon=True)
++    t.start()
++    t.join(timeout)
++    timed_out = t.is_alive()
++    if timed_out:
++        try:
++            os.killpg(proc.pid, _signal.SIGKILL)
++        except ProcessLookupError:
++            pass
++        t.join()
++
++    out = buf if not capped else _CappedStdout(head, "".join(tail_chunks)[-_CMD_STDOUT_TAIL:], total)
++    if timed_out:
++        raise _subprocess.TimeoutExpired(cmd, timeout, output=out)
++    proc.wait()
++    return _subprocess.CompletedProcess(cmd, proc.returncode, out, None)
++
++
++def _apply_cmd_stdout_cap_override() -> None:
++    """把 clbench 的 _run_process_tree 换成 agent 命令有界版(仅当前进程, 幂等)。"""
++    global _ORIG_RUN_PROCESS_TREE
++    import src.tasks.container_backend as _cb_mod
++
++    if getattr(_cb_mod, "_MILES_STDOUT_CAP_APPLIED", False):
++        return
++    _ORIG_RUN_PROCESS_TREE = _cb_mod._run_process_tree
++    _cb_mod._run_process_tree = _run_process_tree_capped
++    _cb_mod._MILES_STDOUT_CAP_APPLIED = True
++    print(
++        f"[codebase_rollout] agent 命令 stdout 有界捕获 head={_CMD_STDOUT_HEAD}B tail={_CMD_STDOUT_TAIL}B "
++        f"(判分/setup 命令全量不受影响; 观测/判分逐字节保真)",
++        flush=True,
++    )
++
++
+ # 模型偶尔会吐出孤立的 UTF-16 代理字符(如 \ud834, 音乐符号 U+1D1xx 的高位代理), 会让
+ # pydantic model_dump_json / JSON 序列化直接崩(surrogates not allowed), 掀翻整个训练步。
+ # 合法的 astral 字符在 Python str 里是单码点、不落在代理区(D800-DFFF), 所以此处只删真正孤立
+@@ -529,6 +671,7 @@ _ORIG_SINGULARITY_EXEC_ARGS = os.environ.get("CLBENCH_SINGULARITY_EXEC_ARGS")
+ def _make_task(args, split: str, instance_ids: list[str], stage_labels: list[str], task_family: str | None = None):
+     root = _clbench_root(args)
+     _apply_text_format_override()
++    _apply_cmd_stdout_cap_override()  # agent 命令 stdout 有界捕获(babel host OOM 修复; 观测/判分零影响)
+     max_steps = _int_env_or_arg("CODEBASE_MAX_STEPS_PER_ISSUE", args, "codebase_max_steps_per_issue", 40)
+     seed = int(getattr(args, "codebase_seed", 42))
+     if task_family == "agentcl_code":
