@@ -592,7 +592,8 @@ async def eval_rollout_single_dataset(
     pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
     for coro in asyncio.as_completed(tasks):
         sample = await coro
-        if do_print:
+        # An episode aborted on its first issue returns an empty list; log the next one instead.
+        if do_print and not (isinstance(sample, list) and not sample):
             logged_sample = sample[0] if isinstance(sample, list) else sample
             logger.info(
                 "eval_rollout_single_dataset example data: "

@@ -834,6 +834,18 @@ def _force_complete_current_issue(task, *, max_steps_per_issue: int):
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:
     args, state, seed = input.args, input.state, input.sample
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    # Decoupled-writer experiments (2026-10-01): CODEBASE_WRITE_MODEL names a separate model in
+    # --sglang-config; WRITE calls go to its router, ACT calls keep the default router. Unset =
+    # WRITE and ACT share one policy (all earlier runs).
+    _write_model = os.environ.get("CODEBASE_WRITE_MODEL", "").strip()
+    if _write_model:
+        from miles.rollout.sglang_rollout import get_model_url
+
+        routers = getattr(args, "sglang_model_routers", None) or {}
+        assert _write_model in routers, f"CODEBASE_WRITE_MODEL={_write_model!r} not in sglang routers {list(routers)}"
+        write_url = get_model_url(args, _write_model, "/generate")
+    else:
+        write_url = url
     sampling_params = deepcopy(input.sampling_params)
     write_params = deepcopy(input.sampling_params)
     write_params["max_new_tokens"] = int(getattr(args, "codebase_memory_max_tokens", 768))
@@ -1227,7 +1239,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             )
             write_ids = _encode_prompt(state, write_messages, enable_thinking=True if _write_think else None)
             previous_memory = memory
-            write_text, write_resp_ids, write_lps, write_finish = await _infer(url, write_ids, write_params)
+            write_text, write_resp_ids, write_lps, write_finish = await _infer(write_url, write_ids, write_params)
             write_sample = _pack_write_sample(seed, write_ids, write_text, write_resp_ids, write_lps, write_finish, trial_pos)
             # WRITE 样本超长处理(用户指令 2026-07-13, 与 ACT 同款 miles 原生语义):
             # prompt 单独超 seq_length -> 整条丢弃; 总长超 -> 尾裁; reward 不动。
