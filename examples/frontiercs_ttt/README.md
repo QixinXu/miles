@@ -1,3 +1,43 @@
+## FrontierSmith group dataset
+
+The same complete-group rollout and official Frontier-CS judge can train on
+the curated FrontierSmith subset. The dataset contains 38 groups of five tasks
+(190 task instances; ten exact Frontier-CS parity duplicates are excluded).
+The prepared task package must be present under
+`$FRONTIERCS_ROOT/qwen_eval/frontiersmith_dataset`; it contains the statements,
+official checkers, hidden tests, curated group manifest, and helper scripts.
+
+Generate the Miles-compatible group JSONL and expose its official checkers and
+hidden tests to the ordinary Frontier-CS judge tree:
+
+```bash
+python3 "$FRONTIERCS_ROOT/qwen_eval/frontiersmith_dataset/build_miles_groups.py"
+python3 "$FRONTIERCS_ROOT/qwen_eval/frontiersmith_dataset/install_training_problems.py" "$FRONTIERCS_ROOT"
+```
+
+The installer creates symlinks only for the 190 selected tasks under
+`$FRONTIERCS_ROOT/algorithmic/problems`; it refuses to replace any existing
+directory or conflicting symlink. Each task provides `statement.txt`,
+`config.yaml`, `chk.cc`, and the original `testdata` directory. Consequently,
+both the rollout's statement loader and the existing HTTP judge use the
+official FrontierSmith evaluator without a second judge implementation.
+
+Select the dataset when launching the standard complete-episode training
+entrypoint:
+
+```bash
+export FRONTIERCS_PROMPT_DATA="$FRONTIERCS_ROOT/qwen_eval/frontiersmith_dataset/miles_problem_groups_38.jsonl"
+export FRONTIERCS_GROUP_SIZE=5
+export FRONTIERCS_RUN_ID=frontiersmith-g38
+bash "$MILES_ROOT/examples/frontiercs_ttt/run_frontiercs_ttt_episode_qwen3.5_4B.sh"
+```
+
+All other rollout, advantage, optimizer, and judge settings remain configurable
+through the existing Frontier-CS variables. The rollout now accepts the
+non-numeric `frontiersmith_N` task IDs used by these groups. The group's
+`shared_thread` annotation is retained in prompt metadata for traceability;
+the task statements themselves remain the solver's problem inputs.
+
 # Frontier-CS group-memory training in Miles
 
 This directory contains the Frontier-CS rollout and training integration for
@@ -176,7 +216,7 @@ The current full experiment settings are:
 | `FRONTIERCS_ACT_ADVANTAGE_MODE` | `group_relative` | Round-local GRPO over the four identical-prompt candidates |
 | `FRONTIERCS_TRAIN_WRITE` | `1` | Set to `0` to generate/use memory but exclude WRITE responses from optimization |
 | `FRONTIERCS_WRITE_CANDIDATES` | `4` | Sibling memories sampled from each identical WRITE prompt |
-| `FRONTIERCS_WRITE_ADVANTAGE_MODE` | `grpo` | Normalize sibling memories by their next-round group scores |
+| `FRONTIERCS_WRITE_ADVANTAGE_MODE` | `grpo` | GRPO over sibling memories using equal-weight per-problem raw-score percentiles |
 | `FRONTIERCS_ACT_MAX_NEW_TOKENS` | `25600` | Maximum problem-solving response length |
 | `FRONTIERCS_WRITE_MAX_NEW_TOKENS` | `25600` | Maximum memory response length |
 | `FRONTIERCS_SEQ_LENGTH` | `32768` | Maximum trainable prompt-plus-response sequence |
@@ -384,16 +424,25 @@ The default sets `FRONTIERCS_WRITE_ADVANTAGE_MODE=grpo` and
 `FRONTIERCS_WRITE_CANDIDATES=4`. After each
 nonterminal solution round, the rollout samples `K_write` memories from the
 same prompt. Every memory conditions a paired-seed evaluation of the next
-round's `G*K_act` solutions. Its reward is that branch's bounded current score,
-averaged first across candidates for each problem and then across the `G`
-problems.
+round's `G*K_act` solutions. For each problem, the rollout averages that
+branch's raw scorer values across its `K_act` solutions, orients them so higher
+is always better, and ranks the `K_write` sibling branches. The rank is mapped
+to `[0,1]`; the group reward is the mean of these per-problem percentiles, so
+every problem contributes equally regardless of its scorer's units. Invalid
+submissions rank below valid ones; ties receive their average rank.
 
 The `K_write` rewards from the same episode and writer round are standardized
-with sample standard deviation. All memory candidates enter the memory loss,
-but only the highest-scoring memory and its downstream solution branch continue
-on the main path. Non-winning downstream solutions are evaluator-only and do
-not enter the solution loss. Ties select the lower memory-candidate index for
-deterministic replay.
+with sample standard deviation for the WRITE loss. All memory candidates enter
+the memory loss, but only the highest group reward memory and its downstream
+solution branch continue on the main path. Non-winning downstream solutions
+are evaluator-only and do not enter the solution loss. Ties select the lower
+memory-candidate index for deterministic replay.
+
+ACT advantages use each task's raw `score_unbounded` (falling back to the
+bounded judge score only when absent), with minimize objectives sign-flipped;
+the `K_act` candidates for the same problem and round are then GRPO-normalized.
+The bounded 0--100 score remains in traces and score metrics for readability,
+not as the ACT advantage signal.
 
 Exploration reward still judges only the selected main-path memory delta. After
 the final solution round, exactly one terminal memory is generated for its
@@ -431,3 +480,96 @@ section distinguishes static stderr usage (`stderr_print_frac` and
 exploration reward mean, same-problem group zero-std fraction, and mean group
 standard deviation. It does not upload prompts, code, diagnostics, or memory
 text.
+
+## ALE-Bench backend
+
+The rollout can use ALE-Bench's official public evaluator instead of the
+Frontier-CS checker. This code path supports batch and reactive tasks through
+the official `Session.public_eval` runner. It is a local integration and does
+not change the default Frontier-CS backend.
+
+On the judge node, install the official ALE-Bench package, ensure Docker is
+available, and point `ALE_BENCH_DATA` to a folder containing the official
+problem ZIPs and ID lists. Then start the authenticated service:
+
+```bash
+export PYTHONPATH="${FRONTIERCS_ROOT}:${PYTHONPATH}"
+export ALE_BENCH_DATA="${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/upstream"
+export ALE_BENCH_JUDGE_TOKEN="$(openssl rand -hex 32)"
+export ALE_BENCH_JUDGE_HOST=127.0.0.1
+python "${MILES_ROOT}/examples/frontiercs_ttt/frontiercs_ale_judge.py" --serve
+```
+
+The service binds to localhost by default. For a separate judge node, explicitly
+bind it to a cluster-private interface and use the same `ALE_BENCH_JUDGE_TOKEN`
+only in trusted Miles workers; firewall the port to the training nodes. The
+service executes submitted programs, so do not expose it to the public network.
+Limit judge load with `ALE_BENCH_MAX_CONCURRENT_EVALUATIONS` (default 4) and
+`ALE_BENCH_NUM_WORKERS` (default 4 workers per evaluation).
+
+On every Miles worker, set:
+
+```bash
+export FRONTIERCS_ALE_JUDGE_URL="http://<judge-private-address>:8082"
+export ALE_BENCH_JUDGE_TOKEN="<same-secret>"
+export ALE_BENCH_CATALOG="${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/ale_bench_task_catalog_40.jsonl"
+export FRONTIERCS_PROMPT_DATA="${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/miles_problem_groups_8x5.jsonl"
+export FRONTIERCS_GROUP_SIZE=5
+export FRONTIERCS_RUN_ID=ale-bench-g8
+```
+
+ALE-Bench uses the full public seeds for each of its 40 tasks (50 per task in
+this release). The judge returns a log-scaled, direction-aware 0–100 training
+utility and separately records the raw public score; this transform is not the
+official leaderboard score. `ALE_BENCH_SCORE_REFERENCE` defaults to 1e9 and
+should be sanity-checked against pilot results before large runs. Private seeds
+and `private_eval` are not used. Image input is optional and disabled by
+default. Set `FRONTIERCS_USE_STATEMENT_IMAGES=1` to include extracted statement
+figures in the model prompt; use a model/processor with vision support and make
+the catalog's `extracted/<task>/images` assets available on every rollout
+worker. Ensure `qwen-vl-utils` is installed in the Miles environment. The flag
+has no effect on Frontier-CS or FrontierSmith statements.
+
+The ALE judge still records a global log-transformed 0--100 score for readable
+traces and score metrics, but the training advantages now use raw public scorer
+values: direction-corrected raw scores for ACT, and per-problem sibling ranks
+before forming WRITE group rewards. This avoids comparing raw score units
+across unrelated problems. It is still not ALE-Bench's official final metric:
+official evaluation uses private-test totals to rank against contest
+participants, maps each task rank to performance, and reports mean performance
+across tasks. Private scores and standings are not used during training.
+
+## Training from multiple data sources in one run
+
+The episode rollout routes each problem to its own judge from row metadata, so
+one Miles prompt stream can contain Frontier-CS, FrontierSmith, and ALE-Bench
+groups. The launcher accepts a semicolon-separated list of `DATASET=JSONL`
+entries through `FRONTIERCS_PROMPT_DATA_SOURCES`; it merges them into a
+run-specific JSONL, round-robin interleaves source rows, annotates each row's
+`metadata.dataset`, and namespaces `group_id` to avoid collisions. Each source
+file's rows are included exactly once, so source proportions follow the number
+of groups supplied by each file. Existing `problem_datasets` metadata is
+preserved for intentionally mixed-source groups.
+
+All groups in one run must have the same number of problems because
+`FRONTIERCS_GROUP_SIZE` is a single rollout parameter. The currently prepared
+FrontierSmith and ALE-Bench group files both use five problems per group; use a
+Frontier-CS group file with the same group size for a combined run.
+
+```bash
+export FRONTIERCS_PROMPT_DATA_SOURCES="frontier_cs=/path/to/fcs_groups.jsonl;frontiersmith=${FRONTIERCS_ROOT}/qwen_eval/frontiersmith_dataset/miles_problem_groups_38.jsonl;ale_bench=${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/miles_problem_groups_8x5.jsonl"
+export FRONTIERCS_GROUP_SIZE=5
+export FRONTIERCS_ALE_JUDGE_URL="http://<judge-private-address>:8082"
+export ALE_BENCH_JUDGE_TOKEN="<same-secret>"
+export ALE_BENCH_CATALOG="${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/ale_bench_task_catalog_40.jsonl"
+# Optional: include ALE statement figures for vision-capable model runs.
+export FRONTIERCS_USE_STATEMENT_IMAGES=1
+bash "${MILES_ROOT}/examples/frontiercs_ttt/run_frontiercs_ttt_episode_qwen3.5_4B.sh"
+```
+
+Alternatively, create the merged file explicitly with
+`python3 ${MILES_ROOT}/examples/frontiercs_ttt/merge_group_datasets.py` and
+repeated `--source DATASET=JSONL` arguments, then set
+`FRONTIERCS_PROMPT_DATA` to the result. Set either `FRONTIERCS_PROMPT_DATA` or
+`FRONTIERCS_PROMPT_DATA_SOURCES`, not both. The source labels accepted are
+`frontier_cs`, `frontiersmith`, and `ale_bench` (with common aliases).

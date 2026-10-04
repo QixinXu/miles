@@ -21,6 +21,9 @@ frontiercs_judge_poll_seconds: 1
 # pass through the group memory.
 frontiercs_act_code_context: none
 frontiercs_enable_thinking: true
+# ALE-Bench only: include statement figures in ACT prompts when the model has a
+# vision processor. Leave false for text-only baselines and Frontier-CS tasks.
+frontiercs_use_statement_images: false
 # Set false to keep generating/using memory while excluding all WRITE outputs
 # from the optimizer batch. ACT-only training still traces every memory update.
 frontiercs_train_write: true

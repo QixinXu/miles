@@ -29,6 +29,11 @@ export FRONTIERCS_AUTO_START_JUDGE=0
 # export JUDGE_SANDBOX_PATH=/compiler/bin:/system/bin
 
 # Main experiment settings.
+# Choose one group-data mode. For a mixed run, every JSONL must use the same
+# number of problems per group; source rows are included once and round-robin
+# merged by the launcher. Do not set both variables.
+# export FRONTIERCS_PROMPT_DATA=/absolute/path/to/a/single_source_groups.jsonl
+# export FRONTIERCS_PROMPT_DATA_SOURCES='frontier_cs=/absolute/path/to/fcs_groups.jsonl;frontiersmith=/absolute/path/to/frontiersmith_groups.jsonl;ale_bench=/absolute/path/to/ale_groups.jsonl'
 export FRONTIERCS_GROUP_SIZE=3
 export FRONTIERCS_GROUPS_PER_UPDATE=2
 export FRONTIERCS_MEMORY_ROUNDS=4
@@ -46,6 +51,13 @@ export FRONTIERCS_ACT_MAX_NEW_TOKENS=25600
 export FRONTIERCS_WRITE_MAX_NEW_TOKENS=25600
 export FRONTIERCS_SEQ_LENGTH=32768
 export FRONTIERCS_MAX_TOKENS_PER_GPU=32768
+# ALE-Bench image statements only; requires a vision processor and
+# qwen-vl-utils. The default keeps all sources text-only.
+export FRONTIERCS_USE_STATEMENT_IMAGES=0
+# When ALE-Bench groups are included, start its judge service and set:
+# export FRONTIERCS_ALE_JUDGE_URL=http://127.0.0.1:8082
+# export ALE_BENCH_JUDGE_TOKEN=<same-secret-used-by-the-judge-service>
+# export ALE_BENCH_CATALOG=/absolute/path/to/Frontier-CS/qwen_eval/ale_bench_dataset/ale_bench_task_catalog_40.jsonl
 
 # Optional ACT exploration shaping. A positive beta generates one memory after
 # every ACT round, including a terminal memory after the final round. An

@@ -10,7 +10,7 @@ from miles.rollout.base_types import GenerateFnInput
 from miles.utils.types import Sample
 
 from examples.frontiercs_ttt import frontiercs_rollout as rollout
-from qwen_eval.frontiercs_ttt.types import JudgeFeedback
+from qwen_eval.frontiercs_ttt.types import CandidateRecord, JudgeFeedback
 
 
 class FakeTokenizer:
@@ -62,6 +62,69 @@ std::cout << value;
     )
     assert reasoning == ""
     assert visible == "```cpp\nint main(){}\n```"
+
+
+def test_problem_source_resolution_supports_mixed_dataset_streams():
+    assert rollout._resolve_problem_source("174", None, "ale_bench") == "frontier_cs"
+    assert rollout._resolve_problem_source("frontiersmith_12", None, "ale_bench") == "frontiersmith"
+    assert rollout._resolve_problem_source("ahc001", None, "frontier_cs") == "ale_bench"
+    assert rollout._resolve_problem_source("174", "frontiersmith", "ale_bench") == "frontiersmith"
+
+
+def _scored_record(problem_id, score, *, direction="maximize", status="done"):
+    return CandidateRecord(
+        problem_id=problem_id,
+        round_index=1,
+        candidate_index=0,
+        act_prompt="",
+        response="",
+        reasoning="",
+        code="",
+        completion_tokens=0,
+        finish_reason="stop",
+        feedback=JudgeFeedback(
+            status=status,
+            score=50.0,
+            score_unbounded=score,
+            raw={"score_type": direction},
+        ),
+    )
+
+
+def test_write_group_reward_ranks_raw_scores_per_problem_before_averaging():
+    branches = [
+        [
+            (_scored_record("maximize_large_units", 10.0), None),
+            (_scored_record("maximize_large_units", 20.0), None),
+            (_scored_record("minimize_small_units", 1.0, direction="minimize"), None),
+            (_scored_record("minimize_small_units", 2.0, direction="minimize"), None),
+        ],
+        [
+            (_scored_record("maximize_large_units", 10000.0), None),
+            (_scored_record("maximize_large_units", 20000.0), None),
+            (_scored_record("minimize_small_units", 1000.0, direction="minimize"), None),
+            (_scored_record("minimize_small_units", 2000.0, direction="minimize"), None),
+        ],
+    ]
+
+    rewards = rollout._write_task_rank_rewards(
+        branches, ["maximize_large_units", "minimize_small_units"]
+    )
+
+    # Branch 1 wins the maximize task and branch 0 wins the minimize task;
+    # their task percentiles balance despite radically different score units.
+    assert rewards == pytest.approx([0.5, 0.5])
+
+
+def test_write_group_reward_ranks_invalid_branch_below_valid_branch():
+    branches = [
+        [(_scored_record("ahc001", 1.0, direction="minimize", status="compile_error"), None)],
+        [(_scored_record("ahc001", 100.0, direction="minimize"), None)],
+    ]
+
+    rewards = rollout._write_task_rank_rewards(branches, ["ahc001"])
+
+    assert rewards == [0.0, 1.0]
 
 
 def _input(tmp_path, round_index):

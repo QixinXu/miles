@@ -47,15 +47,18 @@ from .frontiercs_rollout import (
     _env_or_arg,
     _group_root,
     _group_score,
+    _hydrate_multimodal_samples,
     _infer,
     _int_setting,
     _load_json,
+    _make_judge,
     _pack_sample,
     _problem,
     _run_root,
     _sampling_params,
     _update_best,
     _visible_response,
+    _write_task_rank_rewards,
 )
 
 
@@ -191,6 +194,19 @@ def _episode_settings(input: GenerateFnInput) -> dict[str, Any]:
     metadata = dict(input.sample.metadata or {})
     group_id = str(metadata.get("group_id") or "")
     problem_ids = [str(value) for value in (metadata.get("problem_ids") or [])]
+    group_dataset = metadata.get("dataset")
+    problem_datasets = dict(metadata.get("problem_datasets") or {})
+    legacy_backend = _env_or_arg(
+        args, "FRONTIERCS_JUDGE_BACKEND", "frontiercs_judge_backend", "frontier_cs"
+    )
+    problem_sources = {
+        problem_id: _resolve_problem_source(
+            problem_id,
+            problem_datasets.get(problem_id) or group_dataset,
+            legacy_backend,
+        )
+        for problem_id in problem_ids
+    }
     if not group_id or not problem_ids:
         raise ValueError("prompt metadata must contain group_id and non-empty problem_ids")
     if len(set(problem_ids)) != len(problem_ids):
@@ -285,6 +301,13 @@ def _episode_settings(input: GenerateFnInput) -> dict[str, Any]:
         "trace_group_id": trace_group_id,
         "episode_index": episode_index,
         "problem_ids": problem_ids,
+        "problem_sources": problem_sources,
+        "use_statement_images": _bool_setting(
+            args,
+            "FRONTIERCS_USE_STATEMENT_IMAGES",
+            "frontiercs_use_statement_images",
+            False,
+        ),
         "group_size": group_size,
         "candidates_per_problem": candidates_per_problem,
         "memory_rounds": memory_rounds,
@@ -460,10 +483,10 @@ async def _generate_episode_write_grpo_locked(
     committed = _load_json(commit_path)
     if committed is not None:
         return GenerateFnOutput(
-            samples=[
+            samples=_hydrate_multimodal_samples([
                 Sample.from_dict(value)
                 for value in (committed.get("train_samples") or [])
-            ]
+            ])
         )
 
     act_max_new_tokens = _int_setting(
@@ -506,6 +529,9 @@ async def _generate_episode_write_grpo_locked(
         memory_rounds=memory_rounds,
         act_code_context=act_code_context,
         semantics={
+            "source_by_problem": settings["problem_sources"],
+            "use_statement_images": settings["use_statement_images"],
+            "task_reward_version": "raw_scorer_act_and_per_problem_rank_write_v1",
             "write_advantage_mode": "grpo",
             "write_candidates": write_candidates,
             "write_reward": "next_round_current_group_mean_score",
@@ -545,34 +571,14 @@ async def _generate_episode_write_grpo_locked(
         raise ValueError("WRITE-GRPO episode state cannot contain a pending WRITE sample")
 
     trace = TraceStore(run_root)
-    problems = [_problem(problem_id) for problem_id in problem_ids]
-    judge = FrontierAlgorithmJudge(
-        str(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_URL",
-                "frontiercs_judge_url",
-                "http://127.0.0.1:8081",
-            )
-        ),
-        timeout_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_TIMEOUT_SECONDS",
-                "frontiercs_judge_timeout_seconds",
-                1800.0,
-            )
-        ),
-        poll_interval_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_POLL_SECONDS",
-                "frontiercs_judge_poll_seconds",
-                1.0,
-            )
-        ),
-        diagnostics_limit=diagnostics_chars,
-    )
+    problems = [
+        _problem(
+            problem_id,
+            dataset=settings["problem_sources"][problem_id],
+            use_statement_images=settings["use_statement_images"],
+        )
+        for problem_id in problem_ids
+    ]
     seq_length = int(getattr(args, "seq_length", 32768))
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     train_samples = [
@@ -603,7 +609,7 @@ async def _generate_episode_write_grpo_locked(
                     _candidate(
                         input=input,
                         trace=trace,
-                        judge=judge,
+                        judge=_make_judge(args, dataset=problem.dataset),
                         url=url,
                         group_id=trace_group_id,
                         round_index=round_index,
@@ -701,7 +707,7 @@ async def _generate_episode_write_grpo_locked(
                             _candidate(
                                 input=input,
                                 trace=trace,
-                                judge=judge,
+                                judge=_make_judge(args, dataset=problem.dataset),
                                 url=url,
                                 group_id=trace_group_id,
                                 round_index=next_round_index,
@@ -736,8 +742,12 @@ async def _generate_episode_write_grpo_locked(
                 _group_score([pair[0] for pair in branch], problem_ids)
                 for branch in branches
             ]
+            branch_objective_rewards = _write_task_rank_rewards(
+                branches, problem_ids
+            )
             winner_index = max(
-                range(write_candidates), key=lambda index: (branch_scores[index], -index)
+                range(write_candidates),
+                key=lambda index: (branch_objective_rewards[index], -index),
             )
 
             for writer_index, ((writer_record, writer_sample), branch) in enumerate(
@@ -753,12 +763,17 @@ async def _generate_episode_write_grpo_locked(
                     "downstream_group_score_0_100": branch_score,
                     "selected_for_main_path": selected,
                     "write_reward_mode": "branch_downstream",
+                    "write_task_rank_reward": branch_objective_rewards[writer_index],
+                    "write_selection_metric": "mean_within_problem_raw_score_percentile",
                 }
                 writer_record = {
                     **writer_record,
                     "downstream_round": next_round_index,
                     "parent_group_score_0_100": current_group_score,
                     "downstream_group_score_0_100": branch_score,
+                    "downstream_group_objective_reward": branch_objective_rewards[
+                        writer_index
+                    ],
                     "selected_for_main_path": selected,
                 }
                 writer_root = _writer_candidate_root(round_root, writer_index)
@@ -771,6 +786,10 @@ async def _generate_episode_write_grpo_locked(
                         "round_index": next_round_index,
                         "paired_sampling_seed_base": next_seed_base,
                         "group_score_0_100": branch_score,
+                        "group_objective_reward": branch_objective_rewards[
+                            writer_index
+                        ],
+                        "selection_metric": "mean_within_problem_raw_score_percentile",
                         "selected_for_main_path": selected,
                         "candidate_scores_0_100": [
                             {
@@ -868,6 +887,8 @@ async def _generate_episode_write_grpo_locked(
                 "selected_candidate_index": winner_index,
                 "selection_score_0_100": branch_scores[winner_index],
                 "candidate_scores_0_100": branch_scores,
+                "selection_objective_reward": branch_objective_rewards[winner_index],
+                "candidate_objective_rewards": branch_objective_rewards,
                 "reward_available_after_round": next_round_index,
                 "exploration": exploration_result,
             }
@@ -1055,7 +1076,7 @@ async def _generate_episode_write_grpo_locked(
         "train_samples": [sample.to_dict() for sample in train_samples],
     }
     _atomic_json(commit_path, episode_value)
-    return GenerateFnOutput(samples=train_samples)
+    return GenerateFnOutput(samples=_hydrate_multimodal_samples(train_samples))
 
 
 async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
@@ -1079,10 +1100,10 @@ async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
     committed = _load_json(commit_path)
     if committed is not None:
         return GenerateFnOutput(
-            samples=[
+            samples=_hydrate_multimodal_samples([
                 Sample.from_dict(value)
                 for value in (committed.get("train_samples") or [])
-            ]
+            ])
         )
 
     act_max_new_tokens = _int_setting(
@@ -1129,6 +1150,9 @@ async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
         memory_rounds=memory_rounds,
         act_code_context=act_code_context,
         semantics={
+            "source_by_problem": settings["problem_sources"],
+            "use_statement_images": settings["use_statement_images"],
+            "task_reward_version": "raw_scorer_act_and_per_problem_rank_write_v1",
             "write_reward_mode": reward_mode,
             "act_max_new_tokens": act_max_new_tokens,
             "write_max_new_tokens": write_max_new_tokens,
@@ -1158,34 +1182,14 @@ async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
         )
 
     trace = TraceStore(run_root)
-    problems = [_problem(problem_id) for problem_id in problem_ids]
-    judge = FrontierAlgorithmJudge(
-        str(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_URL",
-                "frontiercs_judge_url",
-                "http://127.0.0.1:8081",
-            )
-        ),
-        timeout_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_TIMEOUT_SECONDS",
-                "frontiercs_judge_timeout_seconds",
-                1800.0,
-            )
-        ),
-        poll_interval_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_POLL_SECONDS",
-                "frontiercs_judge_poll_seconds",
-                1.0,
-            )
-        ),
-        diagnostics_limit=diagnostics_chars,
-    )
+    problems = [
+        _problem(
+            problem_id,
+            dataset=settings["problem_sources"][problem_id],
+            use_statement_images=settings["use_statement_images"],
+        )
+        for problem_id in problem_ids
+    ]
     seq_length = int(getattr(args, "seq_length", 32768))
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     train_samples = [
@@ -1218,7 +1222,7 @@ async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
                     _candidate(
                         input=input,
                         trace=trace,
-                        judge=judge,
+                        judge=_make_judge(args, dataset=problem.dataset),
                         url=url,
                         group_id=trace_group_id,
                         round_index=round_index,
@@ -1502,7 +1506,7 @@ async def _generate_episode_locked(input: GenerateFnInput) -> GenerateFnOutput:
         "train_samples": [sample.to_dict() for sample in train_samples],
     }
     _atomic_json(commit_path, episode_value)
-    return GenerateFnOutput(samples=train_samples)
+    return GenerateFnOutput(samples=_hydrate_multimodal_samples(train_samples))
 
 
 async def generate_episode(input: GenerateFnInput) -> GenerateFnOutput:

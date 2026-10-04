@@ -8,6 +8,7 @@ group-relative ACT advantages and sibling-memory WRITE GRPO.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -91,6 +92,44 @@ def _standardized(values: list[float], *, use_std: bool) -> list[float]:
     # Match Miles' default ``torch.std`` GRPO normalization (correction=1).
     denominator = sample_std(values) + 1e-6
     return [value / denominator for value in centered]
+
+
+def _act_objective_rewards(
+    indices: list[int], samples: list[Any], bounded_rewards: list[float]
+) -> dict[int, float]:
+    """Use raw scorer values for ACT, making candidate failures strictly worst."""
+    values: dict[int, float] = {}
+    valid_by_group: dict[tuple[str, str], list[int]] = defaultdict(list)
+    grouped: dict[tuple[str, str], list[int]] = defaultdict(list)
+    for index in indices:
+        metadata = samples[index].metadata or {}
+        key = (
+            str(metadata.get("group_id") or ""),
+            str(metadata.get("problem_id") or ""),
+        )
+        raw_value = metadata.get("raw_objective_score")
+        value = bounded_rewards[index] if raw_value is None else float(raw_value)
+        is_valid = bool(metadata.get("objective_score_valid", True)) and math.isfinite(value)
+        values[index] = value
+        grouped[key].append(index)
+        if is_valid:
+            valid_by_group[key].append(index)
+
+    for key, members in grouped.items():
+        valid_members = valid_by_group[key]
+        if not valid_members:
+            for index in members:
+                values[index] = 0.0
+            continue
+        valid_values = [values[index] for index in valid_members]
+        minimum = min(valid_values)
+        spread = max(valid_values) - minimum
+        failure_margin = max(spread, abs(minimum) * 1e-6, 1.0)
+        failure_value = minimum - failure_margin
+        for index in members:
+            if index not in valid_members:
+                values[index] = failure_value
+    return values
 
 
 def exploration_score_groups(
@@ -225,10 +264,13 @@ def reward_post_process(args: Any, samples: list[Any]) -> tuple[list[float], lis
     for index, sample in enumerate(samples):
         phase = str((sample.metadata or {}).get("phase") or "act")
         (write_indices if phase == "write" else act_indices).append(index)
+    act_objective_rewards = _act_objective_rewards(
+        act_indices, samples, raw_rewards
+    )
 
     if act_mode == "raw":
         for index in act_indices:
-            advantages[index] = raw_rewards[index]
+            advantages[index] = act_objective_rewards[index]
     elif act_mode == "task_baseline":
         baselines = _load_task_baselines(args)
         missing: set[str] = set()
@@ -283,7 +325,7 @@ def reward_post_process(args: Any, samples: list[Any]) -> tuple[list[float], lis
             # n_samples_per_prompt=1. Standardize explicitly so Miles cannot
             # disable the requested GRPO std normalization at the outer level.
             normalized = _standardized(
-                [raw_rewards[index] for index in indices], use_std=True
+                [act_objective_rewards[index] for index in indices], use_std=True
             )
             for index, value in zip(indices, normalized, strict=True):
                 advantages[index] = value
@@ -319,7 +361,7 @@ def reward_post_process(args: Any, samples: list[Any]) -> tuple[list[float], lis
                     f"group {key!r} contains {len(indices)}"
                 )
             normalized = _standardized(
-                [raw_rewards[index] for index in indices], use_std=True
+                [act_objective_rewards[index] for index in indices], use_std=True
             )
             for index, value in zip(indices, normalized, strict=True):
                 advantages[index] = value
@@ -381,7 +423,15 @@ def reward_post_process(args: Any, samples: list[Any]) -> tuple[list[float], lis
             # sees n_samples_per_prompt=1 and disables its global GRPO std flag.
             # Standardize explicitly here to preserve the requested GRPO rule.
             normalized = _standardized(
-                [raw_rewards[index] for index in indices], use_std=True
+                [
+                    float(
+                        (samples[index].metadata or {}).get(
+                            "write_task_rank_reward", raw_rewards[index]
+                        )
+                    )
+                    for index in indices
+                ],
+                use_std=True,
             )
             for index, value in zip(indices, normalized, strict=True):
                 advantages[index] = value

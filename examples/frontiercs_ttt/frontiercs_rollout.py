@@ -11,13 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
+import zlib
 import sys
 import uuid
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+
+from miles.utils.processing_utils import encode_image_for_rollout_engine
 
 
 def _discover_frontiercs_root() -> Path:
@@ -61,6 +65,7 @@ from qwen_eval.frontiercs_ttt.types import (
     ModelReply,
     ProblemSpec,
 )
+from .frontiercs_ale_judge import AleBenchJudge
 
 
 _GROUP_LOCKS: dict[str, asyncio.Lock] = {}
@@ -103,6 +108,165 @@ def _env_or_arg(args: Any, env: str, arg: str, default: Any) -> Any:
 
 def _int_setting(args: Any, env: str, arg: str, default: int) -> int:
     return int(_env_or_arg(args, env, arg, default))
+
+
+def _multimodal_sidecar_path(sample_path: Path, problem_id: str) -> Path:
+    return sample_path.parents[4] / "multimodal_inputs" / f"{problem_id}.pt"
+
+
+def _persist_multimodal_inputs(sample_path: Path, problem_id: str, inputs: dict[str, Any] | None) -> str | None:
+    if not inputs:
+        return None
+    import torch
+
+    path = _multimodal_sidecar_path(sample_path, problem_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.is_file():
+        temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            torch.save({key: value.detach().cpu() for key, value in inputs.items()}, temporary)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return str(path)
+
+
+def _hydrate_multimodal_samples(samples: list[Sample]) -> list[Sample]:
+    import torch
+
+    for sample in samples:
+        sidecar = (sample.metadata or {}).get("multimodal_train_inputs_path")
+        if sidecar and sample.multimodal_train_inputs is None:
+            sample.multimodal_train_inputs = torch.load(sidecar, map_location="cpu", weights_only=True)
+    return samples
+
+
+def _problem_sample_key(problem_id: str) -> int:
+    """Return a stable numeric sample-key component for any benchmark ID."""
+    try:
+        return int(problem_id)
+    except ValueError:
+        return zlib.crc32(problem_id.encode("utf-8"))
+
+
+def _feedback_objective_value(feedback: JudgeFeedback) -> tuple[float, bool, str]:
+    """Return a raw scorer value oriented so larger always means better."""
+    score = feedback.score_unbounded
+    if score is None:
+        score = feedback.score
+    score = float(score)
+    direction = str(
+        feedback.raw.get("score_type")
+        or feedback.raw.get("scoreType")
+        or "maximize"
+    ).strip().lower()
+    if direction.endswith("minimize") or direction in {"min", "minimize", "minimization"}:
+        score = -score
+        direction = "minimize"
+    else:
+        direction = "maximize"
+    invalid_statuses = {
+        "error",
+        "invalid_submission",
+        "compile_error",
+        "time_limit_exceeded",
+        "runtime_error",
+        "memory_limit_exceeded",
+        "wrong_answer",
+    }
+    valid = feedback.status.strip().lower() not in invalid_statuses and math.isfinite(score)
+    return score, valid, direction
+
+
+def _rank_percentiles(values: list[float], valid: list[bool]) -> list[float]:
+    """Rank candidates in [0, 1], with ties averaged and failures ranked last."""
+    if len(values) != len(valid):
+        raise ValueError("objective score/validity lengths disagree")
+    if len(values) == 1:
+        return [0.5]
+    order = sorted(range(len(values)), key=lambda i: (valid[i], values[i] if valid[i] else 0.0))
+    result = [0.0] * len(values)
+    start = 0
+    denominator = len(values) - 1
+    while start < len(order):
+        end = start + 1
+        first = order[start]
+        while end < len(order):
+            other = order[end]
+            tied = valid[first] == valid[other] and (
+                values[first] == values[other] if valid[first] else True
+            )
+            if not tied:
+                break
+            end += 1
+        average_rank = (start + end - 1) / 2.0
+        percentile = average_rank / denominator
+        for position in range(start, end):
+            result[order[position]] = percentile
+        start = end
+    return result
+
+
+def _write_task_rank_rewards(
+    branches: list[list[tuple[CandidateRecord, Sample]]], problem_ids: list[str]
+) -> list[float]:
+    """Average within-problem raw-score percentiles for each WRITE branch."""
+    if len(branches) < 2:
+        raise ValueError("per-problem WRITE comparison requires at least two branches")
+    group_rewards = [0.0] * len(branches)
+    for problem_id in problem_ids:
+        branch_member_indices: list[list[int]] = []
+        values: list[float] = []
+        valid: list[bool] = []
+        for branch in branches:
+            indices = []
+            for record, _ in branch:
+                if record.problem_id != problem_id:
+                    continue
+                value, is_valid, _ = _feedback_objective_value(record.feedback)
+                indices.append(len(values))
+                values.append(value)
+                valid.append(is_valid)
+            if not indices:
+                raise ValueError(f"WRITE branch has no ACT score for problem {problem_id}")
+            branch_member_indices.append(indices)
+
+        valid_values = [value for value, is_valid in zip(values, valid) if is_valid]
+        if valid_values:
+            minimum = min(valid_values)
+            failure_margin = max(
+                max(valid_values) - minimum, abs(minimum) * 1e-6, 1.0
+            )
+            failure_value = minimum - failure_margin
+        else:
+            failure_value = 0.0
+        branch_means = [
+            sum(values[index] if valid[index] else failure_value for index in indices)
+            / len(indices)
+            for indices in branch_member_indices
+        ]
+        # A memory's task score is the mean of its K_act raw scorer results.
+        # Rank the sibling memory branches separately for this task, then give
+        # every task equal weight when forming a group-level WRITE reward.
+        percentiles = _rank_percentiles(branch_means, [True] * len(branch_means))
+        for branch_index, percentile in enumerate(percentiles):
+            group_rewards[branch_index] += percentile / len(problem_ids)
+    return group_rewards
+
+
+def _resolve_problem_source(problem_id: str, explicit_source: Any, legacy_source: Any) -> str:
+    if explicit_source:
+        return str(explicit_source)
+    normalized_id = problem_id.lower()
+    if normalized_id.startswith(("ahc", "toyota")) or normalized_id.startswith("future-contest-"):
+        return "ale_bench"
+    if normalized_id.startswith("frontiersmith_"):
+        return "frontiersmith"
+    # Native Frontier-CS task IDs are numeric. Do not let a legacy global ALE
+    # setting accidentally route those rows to ALE in a mixed data stream.
+    if normalized_id.isdigit():
+        return "frontier_cs"
+    return str(legacy_source or "frontier_cs")
 
 
 def _bool_setting(args: Any, env: str, arg: str, default: bool) -> bool:
@@ -219,19 +383,92 @@ def _encode_prompt(state: Any, user_content: str, *, thinking: bool) -> list[int
     return [int(token) for token in encoded["input_ids"]]
 
 
+def _encode_prompt_with_images(
+    state: Any, user_content: str, image_paths: tuple[str, ...], *, thinking: bool
+) -> tuple[list[int], list[str], dict[str, Any] | None]:
+    """Encode image markers in-place and retain processor tensors for training."""
+    if not image_paths:
+        return _encode_prompt(state, user_content, thinking=thinking), [], None
+    processor = getattr(state, "processor", None)
+    if processor is None:
+        raise RuntimeError(
+            "FRONTIERCS_USE_STATEMENT_IMAGES is enabled, but this model has no "
+            "multimodal processor; load a vision-capable model or disable the flag"
+        )
+    from PIL import Image
+
+    content: list[dict[str, Any]] = []
+    cursor = 0
+    for image_index, image_path in enumerate(image_paths):
+        marker = f"[[ALE_IMAGE_{image_index}]]"
+        marker_pos = user_content.find(marker, cursor)
+        if marker_pos < 0:
+            raise ValueError(f"missing statement-image marker {marker!r} in prompt")
+        if marker_pos > cursor:
+            content.append({"type": "text", "text": user_content[cursor:marker_pos]})
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+        content.append({"type": "image", "image": image})
+        cursor = marker_pos + len(marker)
+    if cursor < len(user_content):
+        content.append({"type": "text", "text": user_content[cursor:]})
+
+    messages = [{"role": "user", "content": content}]
+    try:
+        formatted = state.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=thinking,
+        )
+    except TypeError:
+        formatted = state.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    try:
+        from qwen_vl_utils import process_vision_info
+    except ImportError as exc:
+        raise RuntimeError(
+            "statement-image input requires qwen-vl-utils in the Miles environment"
+        ) from exc
+    patch_size = getattr(getattr(processor, "image_processor", None), "patch_size", 14)
+    images, videos = process_vision_info(messages, image_patch_size=patch_size)
+    processor_output = processor(
+        text=[formatted], images=images, videos=videos, return_tensors="pt"
+    )
+    prompt_ids = processor_output["input_ids"][0]
+    if hasattr(prompt_ids, "tolist"):
+        prompt_ids = prompt_ids.tolist()
+    import torch
+    train_inputs = {
+        key: value
+        for key, value in processor_output.items()
+        if key not in {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "token_type_ids",
+        }
+        and isinstance(value, torch.Tensor)
+    } or None
+    image_data = [encode_image_for_rollout_engine(image) for image in (images or [])]
+    return [int(token) for token in prompt_ids], image_data, train_inputs
+
+
 async def _infer(
     url: str,
     prompt_ids: list[int],
     sampling_params: dict[str, Any],
+    image_data: list[str] | None = None,
 ) -> tuple[str, list[int], list[float], str, dict[str, Any]]:
-    output = await post(
-        url,
-        {
-            "input_ids": prompt_ids,
-            "sampling_params": sampling_params,
-            "return_logprob": True,
-        },
-    )
+    payload = {
+        "input_ids": prompt_ids,
+        "sampling_params": sampling_params,
+        "return_logprob": True,
+    }
+    if image_data:
+        payload["image_data"] = image_data
+    output = await post(url, payload)
     metadata = dict(output.get("meta_info") or {})
     token_logprobs = metadata.get("output_token_logprobs") or []
     response_ids = [int(item[1]) for item in token_logprobs]
@@ -276,6 +513,7 @@ def _pack_sample(
     metadata: dict[str, Any],
     sample_index: int,
     engine_metadata: dict[str, Any],
+    multimodal_train_inputs: dict[str, Any] | None = None,
 ) -> Sample:
     weight_versions: list[str] = []
     if engine_metadata.get("weight_version") is not None:
@@ -292,18 +530,161 @@ def _pack_sample(
         weight_versions=weight_versions,
         status=_sample_status(finish),
         metadata=metadata,
+        multimodal_train_inputs=multimodal_train_inputs,
     )
     sample.validate()
     return sample
 
 
-def _problem(problem_id: str) -> ProblemSpec:
+def _problem(
+    problem_id: str,
+    *,
+    dataset: str | None = None,
+    use_statement_images: bool = False,
+) -> ProblemSpec:
+    source = str(dataset or os.environ.get("FRONTIERCS_JUDGE_BACKEND", "frontier_cs")).strip().lower()
+    if source in {"ale", "ale_bench", "ale-bench", "alebench"}:
+        catalog_path = Path(
+            os.environ.get(
+                "ALE_BENCH_CATALOG",
+                str(_FRONTIERCS_ROOT / "qwen_eval" / "ale_bench_dataset" / "ale_bench_task_catalog_40.jsonl"),
+            )
+        ).expanduser()
+        catalog = getattr(_problem, "_ale_catalog", None)
+        if catalog is None or getattr(_problem, "_ale_catalog_path", None) != catalog_path:
+            catalog = {}
+            with catalog_path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    row = json.loads(line)
+                    catalog[str(row["task_id"])] = row
+            _problem._ale_catalog = catalog
+            _problem._ale_catalog_path = catalog_path
+        row = catalog.get(problem_id)
+        if row is None:
+            raise FileNotFoundError(f"ALE-Bench task {problem_id!r} is absent from {catalog_path}")
+        statement = str(row["prompt"])
+        metadata = dict(row.get("metadata") or {})
+        images: list[str] = []
+        if use_statement_images:
+            catalog_root = catalog_path.parent
+            extracted_root = catalog_root / "extracted" / problem_id
+            raw_data = json.loads((extracted_root / "data.json").read_text(encoding="utf-8"))
+            image_files = dict(raw_data.get("image_files") or {})
+            image_refs: dict[str, list[str]] = {}
+            for source, frames in image_files.items():
+                source_key = source.replace("\\", "/").removeprefix("./")
+                image_refs[source_key] = [str(name) for name in frames]
+
+            def replace_image(match: re.Match[str]) -> str:
+                source = match.group(1).replace("\\", "/").removeprefix("./")
+                frame_names = image_refs.get(source)
+                if not frame_names:
+                    raise FileNotFoundError(
+                        f"statement image {source!r} is missing from ALE data.json for {problem_id}"
+                    )
+                markers = []
+                for frame_name in frame_names:
+                    image_path = (extracted_root / "images" / frame_name).resolve()
+                    if not image_path.is_file():
+                        raise FileNotFoundError(f"missing ALE statement image: {image_path}")
+                    markers.append(f"[[ALE_IMAGE_{len(images)}]]")
+                    images.append(str(image_path))
+                return " ".join(markers)
+
+            statement = re.sub(
+                r"<img\b[^>]*?src=[\"']([^\"']+)[\"'][^>]*>",
+                replace_image,
+                statement,
+                flags=re.IGNORECASE,
+            )
+            statement = re.sub(
+                r"!\[[^]]*\]\(([^)]+)\)", replace_image, statement
+            )
+        else:
+            statement = re.sub(
+                r"!\[([^]]*)\]\([^)]*\)",
+                lambda match: "[Illustration omitted by text-only prompt transport"
+                + (f": {match.group(1)}" if match.group(1).strip() else "")
+                + "]",
+                statement,
+            )
+            statement = re.sub(
+                r"<img\b[^>]*>",
+                "[Illustration omitted by text-only prompt transport]",
+                statement,
+                flags=re.IGNORECASE,
+            )
+        return ProblemSpec(
+            problem_id=problem_id,
+            statement=statement,
+            title=str(metadata.get("title") or problem_id),
+            statement_images=tuple(images),
+            dataset="ale_bench",
+        )
     path = _FRONTIERCS_ROOT / "algorithmic" / "problems" / problem_id / "statement.txt"
     if not path.is_file():
         raise FileNotFoundError(f"missing Frontier-CS statement: {path}")
     statement = path.read_text(encoding="utf-8")
     title = next((line.strip().lstrip("# ") for line in statement.splitlines() if line.strip()), "")
-    return ProblemSpec(problem_id=problem_id, statement=statement, title=title)
+    return ProblemSpec(
+        problem_id=problem_id,
+        statement=statement,
+        title=title,
+        dataset=source or "frontier_cs",
+    )
+
+
+def _make_judge(args: Any, *, dataset: str | None = None):
+    source = str(
+        dataset
+        or _env_or_arg(args, "FRONTIERCS_JUDGE_BACKEND", "frontiercs_judge_backend", "frontier_cs")
+    ).strip().lower()
+    if source in {"ale", "ale_bench", "ale-bench", "alebench"}:
+        return AleBenchJudge(
+            judge_url=str(
+                _env_or_arg(
+                    args,
+                    "FRONTIERCS_ALE_JUDGE_URL",
+                    "frontiercs_ale_judge_url",
+                    "http://127.0.0.1:8082",
+                )
+            ),
+            timeout_seconds=float(
+                _env_or_arg(
+                    args,
+                    "FRONTIERCS_JUDGE_TIMEOUT_SECONDS",
+                    "frontiercs_judge_timeout_seconds",
+                    1800.0,
+                )
+            ),
+        )
+    return FrontierAlgorithmJudge(
+        str(
+            _env_or_arg(
+                args,
+                "FRONTIERCS_JUDGE_URL",
+                "frontiercs_judge_url",
+                "http://127.0.0.1:8081",
+            )
+        ),
+        timeout_seconds=float(
+            _env_or_arg(
+                args,
+                "FRONTIERCS_JUDGE_TIMEOUT_SECONDS",
+                "frontiercs_judge_timeout_seconds",
+                1800.0,
+            )
+        ),
+        poll_interval_seconds=float(
+            _env_or_arg(args, "FRONTIERCS_JUDGE_POLL_SECONDS", "frontiercs_judge_poll_seconds", 1.0)
+        ),
+        diagnostics_limit=_int_setting(
+            args,
+            "FRONTIERCS_DIAGNOSTICS_CHARS",
+            "frontiercs_diagnostics_chars_per_candidate",
+            12_000,
+        ),
+    )
 
 
 def _initial_state(group_id: str, problem_ids: list[str]) -> dict[str, Any]:
@@ -353,13 +734,16 @@ def _update_best(state: dict[str, Any], records: list[CandidateRecord]) -> None:
     best = dict(state.get("best_candidates") or {})
     legacy_zero_best = os.environ.get("FRONTIERCS_LEGACY_ZERO_BEST") == "1"
     for record in records:
-        score = float(record.feedback.score)
-        if score <= 0.0 and not legacy_zero_best:
+        score, valid, direction = _feedback_objective_value(record.feedback)
+        if not valid:
+            continue
+        if direction == "maximize" and score <= 0.0 and not legacy_zero_best:
             continue
         current = dict(best.get(record.problem_id) or {})
         if not current or score > float(current.get("score") or 0.0):
             best[record.problem_id] = {
                 "score": score,
+                "score_0_100": float(record.feedback.score),
                 "round_index": int(record.round_index),
                 "candidate_index": int(record.candidate_index),
                 "code": record.code,
@@ -425,7 +809,7 @@ async def _candidate(
     *,
     input: GenerateFnInput,
     trace: TraceStore,
-    judge: FrontierAlgorithmJudge,
+    judge: Any,
     url: str,
     group_id: str,
     round_index: int,
@@ -453,7 +837,12 @@ async def _candidate(
         return record, Sample.from_dict(json.loads(sample_path.read_text(encoding="utf-8")))
 
     prompt = build_act_prompt(problem, memory, previous_code=previous_code)
-    prompt_ids = _encode_prompt(input.state, prompt, thinking=thinking)
+    prompt_ids, image_data, multimodal_train_inputs = _encode_prompt_with_images(
+        input.state,
+        prompt,
+        problem.statement_images,
+        thinking=thinking,
+    )
     params = _sampling_params(
         input.sampling_params,
         prompt_tokens=len(prompt_ids),
@@ -461,9 +850,14 @@ async def _candidate(
         seq_length=seq_length,
         sampling_seed=seed_base + candidate_index,
     )
-    response, response_ids, logprobs, finish, engine_metadata = await _infer(
-        url, prompt_ids, params
-    )
+    if image_data:
+        response, response_ids, logprobs, finish, engine_metadata = await _infer(
+            url, prompt_ids, params, image_data=image_data
+        )
+    else:
+        response, response_ids, logprobs, finish, engine_metadata = await _infer(
+            url, prompt_ids, params
+        )
     reasoning, visible = _visible_response(response, thinking=thinking)
     code = extract_cpp(visible)
     if not code.strip():
@@ -489,13 +883,21 @@ async def _candidate(
     feedback_status = str(feedback.status or "").strip().lower()
     feedback_error = str(feedback.error or "").lower()
     stderr_print_count = _count_stderr_print_statements(code)
+    raw_objective_score, objective_score_valid, score_direction = (
+        _feedback_objective_value(feedback)
+    )
     metadata = {
         "phase": "act",
         "group_id": group_id,
         "memory_round": round_index,
         "problem_id": problem.problem_id,
+        "dataset": problem.dataset,
         "candidate_index": candidate_index,
         "score_0_100": float(feedback.score),
+        "score_unbounded": feedback.score_unbounded,
+        "raw_objective_score": raw_objective_score,
+        "objective_score_valid": objective_score_valid,
+        "score_direction": score_direction,
         "evaluation_status": feedback_status,
         "executed": feedback_status in {"done", "completed"},
         "compile_error": "compile failed" in feedback_error,
@@ -515,10 +917,15 @@ async def _candidate(
         metadata=metadata,
         sample_index=int(input.sample.index or 0) * 100_000
         + round_index * 1_000
-        + int(problem.problem_id) * 10
+        + _problem_sample_key(problem.problem_id) * 10
         + candidate_index,
         engine_metadata=engine_metadata,
     )
+    sidecar = _persist_multimodal_inputs(
+        sample_path, problem.problem_id, multimodal_train_inputs
+    )
+    if sidecar:
+        packed.metadata["multimodal_train_inputs_path"] = sidecar
     packed.reward = float(feedback.score) / 100.0
     if artifact_root is None:
         trace.save_candidate(group_id, record)
@@ -543,6 +950,17 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
     metadata = dict(input.sample.metadata or {})
     group_id = str(metadata.get("group_id") or "")
     problem_ids = [str(value) for value in (metadata.get("problem_ids") or [])]
+    group_dataset = metadata.get("dataset")
+    problem_datasets = dict(metadata.get("problem_datasets") or {})
+    legacy_backend = _env_or_arg(
+        args, "FRONTIERCS_JUDGE_BACKEND", "frontiercs_judge_backend", "frontier_cs"
+    )
+    def source_for(problem_id: str) -> str:
+        return _resolve_problem_source(
+            problem_id,
+            problem_datasets.get(problem_id) or group_dataset,
+            legacy_backend,
+        )
     if not group_id or not problem_ids:
         raise ValueError("prompt metadata must contain group_id and non-empty problem_ids")
     if len(set(problem_ids)) != len(problem_ids):
@@ -587,6 +1005,10 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
         memory_rounds=memory_rounds,
         act_code_context=act_code_context,
         semantics={
+            "source_by_problem": {
+                problem_id: source_for(problem_id) for problem_id in problem_ids
+            },
+            "task_reward_version": "raw_scorer_act_and_per_problem_rank_write_v1",
             "act_advantage_mode": str(
                 _env_or_arg(
                     args,
@@ -635,6 +1057,12 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
                 "frontiercs_enable_thinking",
                 True,
             ),
+            "use_statement_images": _bool_setting(
+                args,
+                "FRONTIERCS_USE_STATEMENT_IMAGES",
+                "frontiercs_use_statement_images",
+                False,
+            ),
         },
     )
     trace = TraceStore(run_root)
@@ -653,7 +1081,7 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
         if state_after:
             _atomic_json(state_path, state_after)
         samples = [Sample.from_dict(value) for value in committed.get("train_samples") or []]
-        return GenerateFnOutput(samples=samples)
+        return GenerateFnOutput(samples=_hydrate_multimodal_samples(samples))
 
     expected_round = int(state.get("next_round", 0))
     if round_index != expected_round:
@@ -668,39 +1096,20 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
 
     memory_in = str(state.get("memory") or "")
     _atomic_text(round_root / "memory_in.md", memory_in)
-    problems = [_problem(problem_id) for problem_id in problem_ids]
-    judge = FrontierAlgorithmJudge(
-        str(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_URL",
-                "frontiercs_judge_url",
-                "http://127.0.0.1:8081",
-            )
-        ),
-        timeout_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_TIMEOUT_SECONDS",
-                "frontiercs_judge_timeout_seconds",
-                1800.0,
-            )
-        ),
-        poll_interval_seconds=float(
-            _env_or_arg(
-                args,
-                "FRONTIERCS_JUDGE_POLL_SECONDS",
-                "frontiercs_judge_poll_seconds",
-                1.0,
-            )
-        ),
-        diagnostics_limit=_int_setting(
-            args,
-            "FRONTIERCS_DIAGNOSTICS_CHARS",
-            "frontiercs_diagnostics_chars_per_candidate",
-            12_000,
-        ),
+    use_statement_images = _bool_setting(
+        args,
+        "FRONTIERCS_USE_STATEMENT_IMAGES",
+        "frontiercs_use_statement_images",
+        False,
     )
+    problems = [
+        _problem(
+            problem_id,
+            dataset=source_for(problem_id),
+            use_statement_images=use_statement_images,
+        )
+        for problem_id in problem_ids
+    ]
     seq_length = int(getattr(args, "seq_length", 32_768))
     act_max_new_tokens = _int_setting(
         args, "FRONTIERCS_ACT_MAX_NEW_TOKENS", "frontiercs_act_max_new_tokens", 25600
@@ -726,7 +1135,7 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
                 _candidate(
                     input=input,
                     trace=trace,
-                    judge=judge,
+                    judge=_make_judge(args, dataset=problem.dataset),
                     url=url,
                     group_id=group_id,
                     round_index=round_index,
@@ -895,7 +1304,7 @@ async def _generate_locked(input: GenerateFnInput) -> GenerateFnOutput:
     # replays these exact samples rather than sampling or judging again.
     _atomic_json(round_root / "round.json", round_value)
     _atomic_json(state_path, state_after)
-    return GenerateFnOutput(samples=train_samples)
+    return GenerateFnOutput(samples=_hydrate_multimodal_samples(train_samples))
 
 
 async def generate(input: GenerateFnInput) -> GenerateFnOutput:

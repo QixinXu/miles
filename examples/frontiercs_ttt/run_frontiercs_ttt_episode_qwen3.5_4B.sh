@@ -14,6 +14,9 @@ if [ -z "${FRONTIERCS_ROOT}" ] || [ ! -d "${FRONTIERCS_ROOT}/algorithmic/problem
 fi
 FRONTIERCS_ROOT="$(cd -- "${FRONTIERCS_ROOT}" >/dev/null 2>&1 && pwd)"
 PROMPT_DATA="${FRONTIERCS_PROMPT_DATA:-${SCRIPT_DIR}/data/problem_groups_30.jsonl}"
+PROMPT_DATA_SOURCES="${FRONTIERCS_PROMPT_DATA_SOURCES:-}"
+USE_STATEMENT_IMAGES="${FRONTIERCS_USE_STATEMENT_IMAGES:-0}"
+ALE_JUDGE_TOKEN="${ALE_BENCH_JUDGE_TOKEN:-}"
 MEMORY_ROUNDS="${FRONTIERCS_MEMORY_ROUNDS:-4}"
 CANDIDATES_PER_PROBLEM="${FRONTIERCS_CANDIDATES_PER_PROBLEM:-4}"
 GROUP_SIZE="${FRONTIERCS_GROUP_SIZE:-3}"
@@ -48,6 +51,34 @@ OUTPUT_ROOT="${FRONTIERCS_OUTPUT_ROOT:-${FRONTIERCS_ROOT}/qwen_eval/results/fron
 JUDGE_PORT="${FRONTIERCS_JUDGE_PORT:-8081}"
 GOJUDGE_PORT="${FRONTIERCS_GOJUDGE_PORT:-5050}"
 JUDGE_URL="${FRONTIERCS_JUDGE_URL:-http://127.0.0.1:${JUDGE_PORT}}"
+if [ -n "${PROMPT_DATA_SOURCES}" ]; then
+  if [ -n "${FRONTIERCS_PROMPT_DATA:-}" ]; then
+    echo "Set either FRONTIERCS_PROMPT_DATA or FRONTIERCS_PROMPT_DATA_SOURCES, not both." >&2
+    exit 2
+  fi
+  IFS=';' read -r -a SOURCE_SPECS <<< "${PROMPT_DATA_SOURCES}"
+  MERGE_ARGS=()
+  HAS_ALE_SOURCE=0
+  for SOURCE_SPEC in "${SOURCE_SPECS[@]}"; do
+    [ -n "${SOURCE_SPEC}" ] || continue
+    MERGE_ARGS+=(--source "${SOURCE_SPEC}")
+    SOURCE_NAME="${SOURCE_SPEC%%=*}"
+    case "${SOURCE_NAME,,}" in
+      ale|ale_bench|ale-bench) HAS_ALE_SOURCE=1 ;;
+    esac
+  done
+  if [ "${#MERGE_ARGS[@]}" -lt 4 ]; then
+    echo "FRONTIERCS_PROMPT_DATA_SOURCES must name at least two DATASET=/path entries separated by semicolons." >&2
+    exit 2
+  fi
+  if [ "${HAS_ALE_SOURCE}" -eq 1 ] && [ -z "${ALE_JUDGE_TOKEN}" ]; then
+    echo "ALE_BENCH_JUDGE_TOKEN is required when ale_bench is in FRONTIERCS_PROMPT_DATA_SOURCES." >&2
+    exit 2
+  fi
+  PROMPT_DATA="${OUTPUT_ROOT}/${RUN_ID}/input_data/mixed_groups.jsonl"
+  python3 "${SCRIPT_DIR}/merge_group_datasets.py" \
+    "${MERGE_ARGS[@]}" --output "${PROMPT_DATA}"
+fi
 if [ ! -f "${PROMPT_DATA}" ]; then
   echo "Missing group dataset: ${PROMPT_DATA}" >&2
   exit 2
@@ -384,6 +415,10 @@ RUNTIME_ENV_JSON="{
     \"FRONTIERCS_RUN_ID\": \"${RUN_ID}\",
     \"FRONTIERCS_OUTPUT_ROOT\": \"${OUTPUT_ROOT}\",
     \"FRONTIERCS_JUDGE_URL\": \"${JUDGE_URL}\",
+    \"FRONTIERCS_ALE_JUDGE_URL\": \"${FRONTIERCS_ALE_JUDGE_URL:-http://127.0.0.1:8082}\",
+    \"FRONTIERCS_USE_STATEMENT_IMAGES\": \"${USE_STATEMENT_IMAGES}\",
+    \"ALE_BENCH_JUDGE_TOKEN\": \"${ALE_JUDGE_TOKEN}\",
+    \"ALE_BENCH_CATALOG\": \"${ALE_BENCH_CATALOG:-${FRONTIERCS_ROOT}/qwen_eval/ale_bench_dataset/ale_bench_task_catalog_40.jsonl}\",
     \"FRONTIERCS_MEMORY_ROUNDS\": \"${MEMORY_ROUNDS}\",
     \"FRONTIERCS_CANDIDATES_PER_PROBLEM\": \"${CANDIDATES_PER_PROBLEM}\",
     \"FRONTIERCS_GROUP_SIZE\": \"${GROUP_SIZE}\",

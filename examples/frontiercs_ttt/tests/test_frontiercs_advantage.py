@@ -146,6 +146,88 @@ def test_group_relative_uses_std_even_when_outer_grpo_disables_it():
     assert advantages == pytest.approx([-expected, expected], abs=1e-5)
 
 
+def test_act_group_relative_uses_raw_objective_scores_not_bounded_display_scores():
+    args = SimpleNamespace(
+        frontiercs_act_advantage_mode="group_relative",
+        frontiercs_candidates_per_problem=2,
+        frontiercs_write_advantage_mode="direct",
+        frontiercs_act_explore_beta=0.0,
+        grpo_std_normalization=True,
+    )
+    samples = [
+        _sample(
+            0.1,
+            phase="act",
+            group_id="g",
+            memory_round=0,
+            problem_id="174",
+            candidate_index=0,
+            raw_objective_score=1000.0,
+            objective_score_valid=True,
+        ),
+        _sample(
+            0.9,
+            phase="act",
+            group_id="g",
+            memory_round=0,
+            problem_id="174",
+            candidate_index=1,
+            raw_objective_score=100.0,
+            objective_score_valid=True,
+        ),
+    ]
+
+    _, advantages = reward_post_process(args, samples)
+
+    assert advantages == pytest.approx([2**-0.5, -(2**-0.5)], abs=1e-5)
+
+
+def test_invalid_objective_candidate_is_below_valid_candidates():
+    args = SimpleNamespace(
+        frontiercs_act_advantage_mode="group_relative",
+        frontiercs_candidates_per_problem=3,
+        frontiercs_write_advantage_mode="direct",
+        frontiercs_act_explore_beta=0.0,
+        grpo_std_normalization=True,
+    )
+    samples = [
+        _sample(
+            0.0,
+            phase="act",
+            group_id="g",
+            memory_round=0,
+            problem_id="ahc001",
+            candidate_index=0,
+            raw_objective_score=-500.0,
+            objective_score_valid=False,
+        ),
+        _sample(
+            0.1,
+            phase="act",
+            group_id="g",
+            memory_round=0,
+            problem_id="ahc001",
+            candidate_index=1,
+            raw_objective_score=-100.0,
+            objective_score_valid=True,
+        ),
+        _sample(
+            0.2,
+            phase="act",
+            group_id="g",
+            memory_round=0,
+            problem_id="ahc001",
+            candidate_index=2,
+            raw_objective_score=-10.0,
+            objective_score_valid=True,
+        ),
+    ]
+
+    _, advantages = reward_post_process(args, samples)
+
+    assert advantages[0] < advantages[1] < advantages[2]
+
+
 def test_group_relative_rejects_incomplete_candidate_indices():
     args = SimpleNamespace(
         frontiercs_act_advantage_mode="group_relative",

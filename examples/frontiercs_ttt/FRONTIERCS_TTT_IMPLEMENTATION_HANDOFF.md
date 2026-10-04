@@ -103,7 +103,8 @@ perform a train/held-out split.
 | `B` | Complete group episodes collected per optimizer update | `2` |
 | `M_t` | Shared memory supplied to solution round `t` | `M_0` is empty |
 | `C_{t,p,k}` | Candidate for round `t`, problem `p`, sample `k` | one C++ response |
-| `R_{t,p,k}` | Bounded task reward | judge score divided by `100` |
+| `R_{t,p,k}` | Judge score retained for readable metrics | bounded judge score divided by `100` |
+| `U_{t,p,k}` | Direction-correct raw scorer value used for ACT GRPO | `score_unbounded`; negate minimize objectives |
 | `Q_t` | Mean bounded score of the whole group in round `t` | in `[0,100]` |
 | `E_t` | Raw memory-delta exploration score | in `[0,1]` |
 
@@ -438,15 +439,23 @@ come from each Frontier-CS problem configuration and judge implementation.
 
 ### 6.2 Score used for training
 
-The official judge returns a bounded normalized score in `[0,100]` and may also
-return `scoreUnbounded`. The solution sample reward is:
+The judge returns a bounded normalized score in `[0,100]` and may also return
+`scoreUnbounded`. The bounded score remains in `Sample.reward` and in traces and
+score metrics for readable reporting. ACT advantage calculation instead reads
+the raw scorer value from sample metadata:
 
 ```text
-R_task = bounded_score_0_100 / 100
+U = score_unbounded, falling back to bounded_score_0_100 if absent
+U = -U for minimize objectives; otherwise U = U
 ```
 
-`score_unbounded` is made available to the memory writer as evidence but is not
-used for the task reward or the primary W&B score curves.
+For Frontier-CS and FrontierSmith, the unbounded score is already oriented so
+larger is better. ALE-Bench provides `score_type`; minimize tasks are sign-
+flipped. Compile/runtime/judge failures are marked invalid and treated as worse
+than valid candidates in the local ACT comparison. A group-relative ACT
+advantage then standardizes these `U` values only among the `K_act` candidates
+for the same problem and round. The bounded 0--100 score is still used by the
+existing score curves and is not the ACT advantage signal.
 
 The group score for round `t` is not a flat mean over every record when `K` can
 vary. It is calculated as:
@@ -655,14 +664,14 @@ Important fields are:
 
 ### 9.1 Solution task reward
 
-For every candidate:
+For reporting, every candidate keeps its bounded score:
 
 ```text
-r_task[t,p,k] = bounded_score[t,p,k] / 100
+reported_reward[t,p,k] = bounded_score[t,p,k] / 100
 ```
 
-This raw value is retained for reporting even when the training advantage is
-centered or standardized.
+For ACT GRPO, use the direction-correct raw scorer value `U[t,p,k]` defined in
+Section 6.2, then standardize within the same-problem, same-round `K_act` group.
 
 ### 9.2 Delayed memory reward
 
@@ -691,17 +700,22 @@ to downstream performance regressions.
 
 ### 9.3 Counterfactual WRITE-GRPO reward
 
-In WRITE-GRPO mode, every sibling memory receives its own next-round bounded
-current group score:
+In WRITE-GRPO mode, each memory is evaluated by its own next-round ACT branch.
+For each problem, first average the branch's `K_act` direction-correct raw
+scorer values. Then rank the `K_write` sibling memories separately on that
+problem and map the ranks to `[0,1]` percentiles (ties get average rank and
+invalid submissions rank last). Average these per-problem percentiles, giving
+each problem equal weight:
 
 ```text
-r_write[t,j] = Q_(t+1)^j / 100
+r_write[t,j] = mean_p percentile_rank_p(branch j)
 ```
 
-This is deliberately not cumulative-best score: cumulative best could hide a
-harmful memory behind an older strong solution. Subtracting the parent score
-would not change the normalized advantage because it is shared by all siblings,
-but the persisted raw reward is the directly observed downstream score.
+The resulting `K_write` group rewards are standardized against each other for
+the WRITE loss. The main path continues with the memory having the highest
+`r_write`; ties select the lower candidate index. The bounded 0--100 group
+score is still persisted separately for reporting, but it does not determine
+WRITE training advantage or branch selection.
 
 ## 10. Advantage calculation
 
@@ -720,12 +734,12 @@ problem:
 group key = (unique_episode_group_id, round, problem_id)
 ```
 
-For rewards `r_1 ... r_n`, where `n=K_act`:
+For direction-correct raw scorer values `U_1 ... U_n`, where `n=K_act`:
 
 ```text
 mean = sum(r_i) / n
 sample_std = sqrt(sum((r_i - mean)^2) / (n - 1))
-A_task_i = (r_i - mean) / (sample_std + 1e-6)
+A_task_i = (U_i - mean) / (sample_std + 1e-6)
 ```
 
 This mode requires exactly `K_act=4` candidates with indices `0 ... 3` for
@@ -1640,8 +1654,8 @@ without labeling it as a different scaffold.
 2. Preserve the default absence of previous diagnostics/code in solution input.
 3. Preserve solution-reasoning exclusion from writer input.
 4. Preserve no-fallback memory semantics.
-5. Preserve bounded score for task reward and expose unbounded score only as
-   evidence unless a new experiment explicitly changes this.
+5. Keep bounded score for readable reporting; use direction-correct raw scorer
+   values for ACT GRPO and per-problem rank percentiles for WRITE-GRPO.
 6. Preserve within-episode, same-problem temporal normalization; never normalize
    exploration reward across unrelated groups.
 7. Preserve the final terminal-memory distinction: judged, traced, not trained.
