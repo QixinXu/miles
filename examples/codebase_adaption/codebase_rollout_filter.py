@@ -22,7 +22,7 @@ import os
 from argparse import Namespace
 from typing import Any
 
-from examples.codebase_adaption.codebase_advantage import _group_key, explore_beta
+from examples.codebase_adaption.codebase_advantage import _group_key, cod_enabled, cod_value, explore_beta
 
 _EPS = 1e-8
 
@@ -132,8 +132,14 @@ def drop_zero_std_groups(samples: list, evaluation: bool, min_keep: int = 0) -> 
     # beneficiary groups (~40-50% of groups per the module docstring). env-only read:
     # the filter has no args object here, and the arm scripts enable beta via env anyway.
     explore_on = explore_beta(None) > 0
+    # CoD mode: ACT advantages come from cod_return (own + future rewards), so a group is
+    # informative iff those returns differ, not iff this trial's task score differs.
+    cod_on = cod_enabled()
     for key, members in groups.items():
-        rewards = [float(m.reward or 0.0) for m in members]
+        if cod_on:
+            rewards = [cod_value(m) for m in members]
+        else:
+            rewards = [float(m.reward or 0.0) for m in members]
         if len(members) < 2 or (max(rewards) - min(rewards)) > _EPS:
             continue
         if explore_on and key[0] == "act":

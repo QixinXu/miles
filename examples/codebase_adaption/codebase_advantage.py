@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from collections import defaultdict
@@ -159,6 +160,156 @@ def format_only_rewards(
     return out
 
 
+# --- CoD ("Connect the Dots", arXiv 2606.20002) reward/advantage (user 2026-10-18) ---
+# Opt-in via CODEBASE_WRITE_REWARD_MODE=cod; every other mode is untouched. Returns are
+# means of rewards-to-go over a finite window, advantages are per-position group-mean
+# baselined (no std), and the whole batch gets the paper's adaptive RED re-weighting.
+
+
+def cod_enabled() -> bool:
+    return os.environ.get("CODEBASE_WRITE_REWARD_MODE", "").strip().lower() == "cod"
+
+
+def cod_window() -> int:
+    """Future-trial horizon K, aligned with gated_windowed (user 2026-10-18): K trials after the current one."""
+    return max(1, int(os.environ.get("CODEBASE_WRITE_WINDOW", "3")))
+
+
+def cod_act_returns(rewards: list[float], *, window: int = 3) -> dict[int, float]:
+    """ACT return for trial j: mean(reward[j .. j+K]) (own outcome plus the next K trials)."""
+    out: dict[int, float] = {}
+    for j in range(len(rewards)):
+        out[j] = _mean([float(x) for x in rewards[j : j + 1 + window]])
+    return out
+
+
+def cod_write_returns(
+    rewards: list[float],
+    format_ok: dict[int, bool],
+    *,
+    window: int = 3,
+    format_penalty: float = 0.1,
+) -> dict[int, float]:
+    """WRITE return for memory M_k (written after trial k):
+
+    R(M_k) = mean([r_fmt_k] + reward[k+1 .. k+K]),  r_fmt_k = 0 if format_ok else -format_penalty
+
+    The paper's update-context reward is 0 on a parsable hint and -coef on a parse failure; the
+    strict memory_format_ok gate stands in for "parsable" (user 2026-10-18). Memories with an
+    empty next window (episode tail) are omitted, as in every other mode.
+    """
+    out: dict[int, float] = {}
+    for k in range(len(rewards) - 1):
+        nxt = [float(x) for x in rewards[k + 1 : k + 1 + window]]
+        if not nxt:
+            continue
+        r_fmt = 0.0 if format_ok.get(k) else -float(format_penalty)
+        out[k] = _mean([r_fmt] + nxt)
+    return out
+
+
+def cod_red_reweight(
+    advs: list[float],
+    lens: list[float],
+    *,
+    t_min: float = 0.8,
+    t_max: float = 100.0,
+    tol: float = 0.05,
+    max_iter: int = 20,
+) -> tuple[list[float], float | None]:
+    """Adaptive RED-weight (paper App. A, Eq. 3; mirrors Trinity-RFT cod_advantage.py).
+
+    If the token-weighted advantage sum is negative, scale every advantage by exp(A/T) with T
+    found by bisection on [t_min, t_max] so that sum_i A_i*exp(A_i/T)*len_i ~ 0. Returns the
+    (possibly unchanged) advantages and the temperature used (None = not applied).
+    """
+
+    def _sum(temp: float | None) -> float:
+        if temp is None:
+            return sum(a * n for a, n in zip(advs, lens))
+        return sum(a * math.exp(a / temp) * n for a, n in zip(advs, lens))
+
+    if _sum(None) >= 0:
+        return list(advs), None
+    lo, hi, mid = t_min, t_max, t_max
+    for _ in range(max_iter):
+        mid = (lo + hi) / 2
+        if _sum(mid) < 0:
+            hi = mid
+        else:
+            lo = mid
+        if hi - lo < tol:
+            break
+    return [a * math.exp(a / mid) for a in advs], mid
+
+
+def cod_value(sample) -> float:
+    """The scalar a CoD group is baselined on: ACT -> metadata cod_return, WRITE -> its reward
+    (cod_write_returns already wrote the return into sample.reward)."""
+    md = sample.metadata or {}
+    if md.get("phase") != "write" and md.get("cod_return") is not None:
+        return float(md["cod_return"])
+    return float(sample.reward or 0.0)
+
+
+def _cod_reward_post_process(samples):
+    raw_rewards = [float(s.reward or 0.0) for s in samples]
+    values = [cod_value(s) for s in samples]
+    missing = sum(
+        1 for s in samples if (s.metadata or {}).get("phase") != "write" and (s.metadata or {}).get("cod_return") is None
+    )
+    groups: dict[Any, list[int]] = defaultdict(list)
+    for i, sample in enumerate(samples):
+        groups[_group_key(sample)].append(i)
+    advantages = [0.0] * len(samples)
+    for _key, idxs in groups.items():
+        mean = _mean([values[i] for i in idxs])
+        for i in idxs:
+            advantages[i] = values[i] - mean
+    lens = [float(s.effective_response_length) for s in samples]
+    tok_sum = sum(lens) or 1.0
+    pre_mean = sum(a * n for a, n in zip(advantages, lens)) / tok_sum
+    advantages, temp = cod_red_reweight(advantages, lens)
+    post_mean = sum(a * n for a, n in zip(advantages, lens)) / tok_sum
+    act_v = [values[i] for i, s in enumerate(samples) if (s.metadata or {}).get("phase") != "write"]
+    wr_v = [values[i] for i, s in enumerate(samples) if (s.metadata or {}).get("phase") == "write"]
+    print(
+        f"[codebase_advantage] COD K={cod_window()} ACT n={len(act_v)} mean_ret={_mean(act_v):.4f} | "
+        f"WRITE n={len(wr_v)} mean_ret={_mean(wr_v):.4f} | groups={len(groups)} | "
+        f"tok_mean_adv {pre_mean:+.4f} -> {post_mean:+.4f} red_T={temp if temp is None else round(temp, 3)}"
+        + (f" | WARNING {missing} ACT samples lack cod_return (fell back to reward)" if missing else ""),
+        flush=True,
+    )
+    return raw_rewards, advantages
+
+
+# --- SkillRise (arXiv 2607.26784) WRITE return (user 2026-10-21) ---
+# Opt-in via CODEBASE_WRITE_REWARD_MODE=skillrise. ACT keeps its own task score (the paper's
+# "solve" return r_i); only the WRITE ("curate") return changes. Baselining is the stock
+# per-position group mean; the run script adds --disable-grpo-std-normalization (mean_norm).
+
+
+def skillrise_gamma() -> float:
+    return float(os.environ.get("CODEBASE_SKILLRISE_GAMMA", "0.6"))
+
+
+def skillrise_write_returns(
+    rewards: list[float], *, window: int = 3, gamma: float = 0.6
+) -> dict[int, float]:
+    """WRITE return for memory M_k: sum_{j=k+1}^{k+K} gamma^(j-k) * reward[j].
+
+    A plain discounted sum (not a mean), truncated to the next K trials (user 2026-10-21: K=3).
+    Memories with no downstream trial (episode tail) are omitted, as in every other mode.
+    """
+    out: dict[int, float] = {}
+    for k in range(len(rewards) - 1):
+        nxt = [float(x) for x in rewards[k + 1 : k + 1 + window]]
+        if not nxt:
+            continue
+        out[k] = sum(gamma ** (d + 1) * r for d, r in enumerate(nxt))
+    return out
+
+
 _RK_HEADER = re.compile(r"^###\s*Repository Knowledge\s*$", re.M)
 _LP_HEADER = re.compile(r"^###\s*Lessons\s*&\s*Pitfalls\s*$", re.M)
 _ANY_HEADER = re.compile(r"^###\s+.*$", re.M)
@@ -205,6 +356,8 @@ def memory_format_ok(memory: str, prev_memory: str | None = None, *, min_bullets
 
 def reward_post_process(args, samples):
     """args, flat list[Sample] -> (raw_rewards, advantages)."""
+    if cod_enabled():
+        return _cod_reward_post_process(samples)
     raw_rewards = [float(s.reward or 0.0) for s in samples]
     std_norm = getattr(args, "grpo_std_normalization", True)
 

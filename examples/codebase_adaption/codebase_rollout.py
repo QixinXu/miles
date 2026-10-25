@@ -20,7 +20,10 @@ from miles.utils.types import Sample
 from examples.codebase_adaption.codebase_advantage import downstream_improve_rewards
 from examples.codebase_adaption.prompts import (
     build_act_user_content,
+    build_skillrise_act_user_content,
+    build_skillrise_write_messages,
     build_write_messages,
+    skillrise_prompts_enabled,
 )
 from examples.codebase_adaption.schedule import EpisodeOrder, build_episode_order, load_baseline_rewards, stage_lookup_for
 
@@ -984,6 +987,12 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                     pending_user.append(feedback_message["content"])
                 if no_memory:
                     user_content = query.prompt or "(no content)"
+                elif skillrise_prompts_enabled():
+                    user_content = build_skillrise_act_user_content(
+                        memory=memory,
+                        query_prompt=query.prompt,
+                        include_memory=first_turn,
+                    )
                 else:
                     user_content = build_act_user_content(
                         memory=memory,
@@ -1231,12 +1240,19 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
             # 均为 env 开关且默认关, 现役 run 重启口径不漂移。
             _write_v3 = os.environ.get("CODEBASE_WRITE_PROMPT_V3", "").strip().lower() in {"1", "true", "yes", "on"}
             _write_think = os.environ.get("CODEBASE_WRITE_THINKING", "").strip().lower() in {"1", "true", "yes", "on"}
-            write_messages = build_write_messages(
-                previous_memory=memory,
-                instance_messages=trial_messages,
-                v3=_write_v3,
-                prompt_set=meta.get("task_family"),
-            )
+            if skillrise_prompts_enabled():
+                write_messages = build_skillrise_write_messages(
+                    previous_memory=memory,
+                    instance_messages=trial_messages,
+                    success=bool(outcome.get("success")),
+                )
+            else:
+                write_messages = build_write_messages(
+                    previous_memory=memory,
+                    instance_messages=trial_messages,
+                    v3=_write_v3,
+                    prompt_set=meta.get("task_family"),
+                )
             write_ids = _encode_prompt(state, write_messages, enable_thinking=True if _write_think else None)
             previous_memory = memory
             write_text, write_resp_ids, write_lps, write_finish = await _infer(write_url, write_ids, write_params)
@@ -1368,6 +1384,53 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 }
                 write_rewards = format_only_rewards(rewards_seq, fmt_by_k)
                 _write_signal = "format_only"
+            elif _write_mode == "cod":
+                # CoD (arXiv 2606.20002, user 2026-10-18): WRITE return = mean(fmt term +
+                # next K rewards); ACT return = mean(own + next K rewards), stored on the ACT
+                # sample as metadata cod_return (sample.reward stays the task score so every
+                # reward metric keeps its meaning). Baselining/RED live in codebase_advantage.
+                from examples.codebase_adaption.codebase_advantage import (
+                    cod_act_returns,
+                    cod_window,
+                    cod_write_returns,
+                    memory_format_ok,
+                )
+                fmt_by_k = {
+                    int(wp["rewrite_idx"]): memory_format_ok(
+                        wp["audit"].get("memory") or "",
+                        wp["audit"].get("previous_memory") or "",
+                    )
+                    for wp in write_points
+                }
+                write_rewards = cod_write_returns(
+                    rewards_seq,
+                    fmt_by_k,
+                    window=cod_window(),
+                    format_penalty=float(os.environ.get("CODEBASE_COD_FORMAT_PENALTY", "0.1")),
+                )
+                act_returns = cod_act_returns(rewards_seq, window=cod_window())
+                for s in samples:
+                    smd = s.metadata or {}
+                    j = smd.get("trial_pos")
+                    if smd.get("phase") == "act" and j is not None and int(j) in act_returns:
+                        smd["cod_return"] = float(act_returns[int(j)])
+                        s.metadata = smd
+                _write_signal = "cod_return"
+            elif _write_mode == "skillrise":
+                # SkillRise (arXiv 2607.26784, user 2026-10-21): R(M_k) = sum_{j=k+1}^{k+K}
+                # gamma^(j-k) * reward[j], no format term. ACT keeps its own task score.
+                from examples.codebase_adaption.codebase_advantage import (
+                    skillrise_gamma,
+                    skillrise_write_returns,
+                )
+
+                write_rewards = skillrise_write_returns(
+                    rewards_seq,
+                    window=max(1, int(os.environ.get("CODEBASE_WRITE_WINDOW", "3"))),
+                    gamma=skillrise_gamma(),
+                )
+                fmt_by_k = None
+                _write_signal = "skillrise_discounted"
             elif _write_mode == "downstream":
                 # 裸下游: R(M_k)=reward[k+1]; 末位无下游则省略。GRPO 组内归一化承担难度。
                 write_rewards = {
@@ -1396,7 +1459,7 @@ async def generate(input: GenerateFnInput) -> GenerateFnOutput:
                 # 审计标签必须无条件刷新: :856 的初值是 delta 名字, 只在 gated 分支
                 # 刷新曾导致 downstream 组轨迹标签撒谎(2026-07-18 误报事故)
                 wp["audit"]["write_signal"] = _write_signal
-                if _write_mode in ("gated_downstream", "gated_windowed", "format_only"):
+                if _write_mode in ("gated_downstream", "gated_windowed", "format_only", "cod"):
                     wp["audit"]["format_ok"] = bool(fmt_by_k.get(k))
                 sample.metadata = {
                     **meta,

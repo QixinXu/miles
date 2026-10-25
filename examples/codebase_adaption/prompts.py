@@ -23,6 +23,8 @@ co-evolved memory store, not a one-shot summary.
 
 from __future__ import annotations
 
+import os
+
 
 # ── WRITE (memory rewrite) — text verbatim from the offline icl_summary system ──
 MEMORY_SYSTEM = (
@@ -183,3 +185,94 @@ def build_write_messages(
     ]
 
 
+# ── SkillRise baseline prompts (arXiv 2607.26784, user-approved 2026-10-21) ──
+# Same message structure as WRITE v3 (system + read-only transcript + final instruction), but
+# the content follows the paper's curate prompt: a task-agnostic SKILL DOCUMENT instead of the
+# two-section repository memory, with the attempt's outcome stated explicitly. The ACT side
+# injects the document under the paper's solve-prompt wording. Opt-in via
+# CODEBASE_PROMPT_SET=skillrise; every other run keeps the prompts above unchanged.
+
+SKILLRISE_EMPTY_SKILL = "(The skill document is currently empty. No skills have been distilled yet.)"
+
+SKILLRISE_ACT_HEADER = (
+    "## Current Skill Document\n"
+    "The following skills were distilled from earlier tasks of the SAME family. Use them "
+    "only when you are confident they apply to the current situation; ignore any skill "
+    "that does not fit."
+)
+
+SKILLRISE_SYSTEM = (
+    "You are a software engineer solving a sequence of related coding tasks. You maintain "
+    "a SKILL DOCUMENT that distills transferable skills from the tasks you have finished. "
+    "At the end of each task you are given your OLD skill document plus the task you just "
+    "worked on, and you output a revised skill document that helps you solve the LATER "
+    "tasks more reliably."
+)
+
+SKILLRISE_INSTRUCTION_HEAD = (
+    "Above is the entire transcript - the task is OVER. Do NOT continue it, do NOT run "
+    "commands, do NOT output bash. Your ONLY job is to rewrite the skill document based "
+    "on the transcript."
+)
+
+SKILLRISE_INSTRUCTION_RULES = (
+    "Rewrite the skill document. Start from the old document above and refine it with "
+    "what this attempt revealed. Follow these rules strictly:\n"
+    "- ABSTRACT, do not memorize. Remove task-specific instances: replace concrete file "
+    "paths, function/class names, variable names and issue details with general concepts "
+    '("the module under test", "the failing function").\n'
+    "- Ground every statement in what actually happened in the attempt above. Do not "
+    "invent steps you did not observe.\n"
+    "- If the attempt failed, extract the failure point as a concrete pitfall.\n"
+    "- Be CONCISE. Do not pad with generic advice or vague tips. A short, precise document "
+    "beats a long one. If this attempt revealed little new, keep the old document almost "
+    "unchanged.\n"
+    "- Do NOT copy the transcript verbatim. Distill reusable procedure, not history.\n\n"
+    "Suggested (not mandatory) structure — use the headers that fit:\n"
+    "## When to use\n"
+    "## Workflow\n"
+    "## Pitfalls\n\n"
+    "Output ONLY the full revised skill document."
+)
+
+
+def skillrise_prompts_enabled() -> bool:
+    return os.environ.get("CODEBASE_PROMPT_SET", "").strip().lower() == "skillrise"
+
+
+def build_skillrise_act_user_content(*, memory: str, query_prompt: str, include_memory: bool) -> str:
+    """ACT user content with the skill document under the paper's solve-prompt header.
+
+    Unlike build_act_user_content, an empty document is shown as the paper's placeholder
+    (its solve prompt always carries the document section).
+    """
+    parts: list[str] = []
+    if include_memory:
+        doc = (memory or "").strip() or SKILLRISE_EMPTY_SKILL
+        parts.append(f"{SKILLRISE_ACT_HEADER}\n{doc}")
+    if query_prompt:
+        parts.append(query_prompt)
+    return "\n\n".join(parts) if parts else "(no content)"
+
+
+def build_skillrise_write_messages(
+    *,
+    previous_memory: str,
+    instance_messages: list[dict[str, str]],
+    success: bool,
+) -> list[dict[str, str]]:
+    """WRITE (curate) messages: system + read-only transcript + the SkillRise rewrite instruction."""
+    old = (previous_memory or "").strip() or SKILLRISE_EMPTY_SKILL
+    outcome = "SUCCESS" if success else "FAILURE (task not completed)"
+    instr = (
+        f"{SKILLRISE_INSTRUCTION_HEAD}\n\n"
+        f"Outcome of this attempt: {outcome}\n\n"
+        f"## Old Skill Document\n{old}\n\n"
+        f"{SKILLRISE_INSTRUCTION_RULES}"
+    )
+    return [
+        {"role": "system", "content": SKILLRISE_SYSTEM},
+        {"role": "user", "content": WRITE_TRANSCRIPT_PREAMBLE},
+        *[dict(m) for m in instance_messages],
+        {"role": "user", "content": instr},
+    ]
